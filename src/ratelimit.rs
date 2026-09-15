@@ -26,7 +26,6 @@ struct Bucket {
 
 struct DomainRateBucket {
     /// Packed atomic state: upper 32 bits store `epoch_sec`, lower 32 bits store `count`.
-    /// Updating both together in a single CAS transaction guarantees atomic epoch transitions.
     state: AtomicU64,
     penalized_until_sec: AtomicI64,
 }
@@ -63,11 +62,6 @@ impl RateLimiter {
     }
 
     /// Evaluates rate-limiting policies for an incoming query.
-    ///
-    /// Preserves strict separation:
-    /// - All protocols use the subnet token bucket.
-    /// - UDP-specific duplicate-domain RRL and ANY-drops apply exclusively to UDP.
-    /// - TCP, DoT, and DoH never experience duplicate-domain penalties.
     pub fn check_query(
         &self,
         protocol: &str,
@@ -96,7 +90,6 @@ impl RateLimiter {
 
         bucket.last_seen_millis.store(now_ms, Ordering::Relaxed);
 
-        // Thread-safe atomic token bucket refill
         let last_refill = bucket.last_refill_millis.load(Ordering::Acquire);
         let elapsed_ms = (now_ms - last_refill).max(0);
         if elapsed_ms > 0 {
@@ -115,7 +108,6 @@ impl RateLimiter {
             }
         }
 
-        // Point 24: Atomically verify and consume a token; prevents tokens from going negative under contention
         let token_acquired =
             bucket
                 .tokens
@@ -131,15 +123,12 @@ impl RateLimiter {
             return RrlAction::Drop;
         }
 
-        // TCP, DoT, and DoH only use the subnet token bucket
         if protocol != "UDP" {
             return RrlAction::Allow;
         }
 
         let rrl_key = format!("{}:{}:{}", subnet, qname.to_string().to_lowercase(), qtype);
 
-        // Mitigate table-exhaustion DoS: if table is full, do not blackhole the internet;
-        // fall back to allowing new queries through to the subnet token bucket.
         if !self.rrl_buckets.contains_key(&rrl_key)
             && self.rrl_buckets.len() >= MAX_TRACKED_RRL_ENTRIES
         {
@@ -162,8 +151,6 @@ impl RateLimiter {
             return RrlAction::Drop;
         }
 
-        // Point 25: Atomic epoch transition and query counting in a single hardware transaction.
-        // Upper 32 bits = epoch seconds, lower 32 bits = count.
         let mut query_count = 1;
         let _ = domain_entry
             .state
@@ -172,11 +159,9 @@ impl RateLimiter {
                 let curr_count = (val & 0xFFFF_FFFF) as i64;
 
                 if now_s > curr_epoch {
-                    // New second: atomically advance epoch to now_s and reset count to 1
                     query_count = 1;
                     Some(((now_s as u64) << 32) | 1u64)
                 } else {
-                    // Same second: increment count
                     let new_count = (curr_count + 1).min(u32::MAX as i64);
                     query_count = new_count;
                     Some(((curr_epoch as u64) << 32) | (new_count as u64))
@@ -186,7 +171,6 @@ impl RateLimiter {
         if query_count == 1 {
             RrlAction::Allow
         } else if query_count == 2 {
-            // Force client to prove authentic IP via TCP handshake (mitigates IP spoofing)
             RrlAction::Truncate
         } else {
             domain_entry
@@ -196,7 +180,6 @@ impl RateLimiter {
         }
     }
 
-    /// Determines if an unauthenticated UDP response payload exceeds the client's advertised buffer.
     pub fn should_challenge_large_response(
         &self,
         protocol: &str,
@@ -210,7 +193,6 @@ impl RateLimiter {
         resp_bytes > client_max_payload
     }
 
-    /// Prunes stale buckets to bound memory usage.
     pub fn cleanup(&self, max_age: Duration) {
         let cutoff_ms = now_millis() - max_age.as_millis() as i64;
         let cutoff_s = cutoff_ms / 1000;

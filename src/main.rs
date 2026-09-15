@@ -1,14 +1,12 @@
 // src/main.rs
 mod cache;
-mod dns;
 mod dnssec;
-mod doh;
-mod dot;
 mod engine;
 mod ratelimit;
 mod recursor;
 mod tls;
 mod tranco;
+mod transports;
 
 use cache::{
     create_cache, load_cache_from_disk, now_secs, save_cache_to_disk_async, CacheEntry, DnsCache,
@@ -27,6 +25,7 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use transports::{build_doh_router, run_dot_listener, run_tcp_listener, run_udp_listener};
 
 const CACHE_FILE: &str = "cache.json";
 const TRANCO_FILE: &str = "tranco_list.txt";
@@ -44,8 +43,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cache = create_cache();
     let recursor = RecursiveResolver::new();
 
-    // Load persisted cache from disk. Any legacy entries lacking dnssec_status
-    // or exceeding allowable stale windows are automatically discarded.
     load_cache_from_disk(&cache, CACHE_FILE);
 
     let warm_limit: usize = std::env::var("WARM_LIMIT")
@@ -94,7 +91,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(60);
     let rate_limiter = ratelimit::RateLimiter::new(rl_capacity, rl_per_sec);
 
-    // DNSSEC enforcement ON by default per RFC 4035 (set DNSSEC_ENFORCE=0 to disable)
     let dnssec_enforce = std::env::var("DNSSEC_ENFORCE")
         .map(|v| v != "0")
         .unwrap_or(true);
@@ -154,14 +150,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let udp_state = app_state.clone();
     let udp_sem = udp_semaphore.clone();
     tokio::spawn(async move {
-        dns::run_udp_listener(udp_socket, udp_state, udp_sem).await;
+        run_udp_listener(udp_socket, udp_state, udp_sem).await;
     });
 
     let (tcp_listener, _) = bind_tcp(&host, active_dns_port, 5053).await?;
     let tcp_state = app_state.clone();
     let tcp_sem = tcp_semaphore.clone();
     tokio::spawn(async move {
-        dns::run_tcp_listener(tcp_listener, tcp_state, tcp_sem).await;
+        run_tcp_listener(tcp_listener, tcp_state, tcp_sem).await;
     });
 
     let cert_path = std::env::var("CERT_PATH").unwrap_or_else(|_| "fullchain.pem".to_string());
@@ -174,13 +170,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dot_state = app_state.clone();
     let dot_sem = dot_semaphore.clone();
     tokio::spawn(async move {
-        dot::run_dot_listener(dot_listener, dot_acceptor, dot_state, dot_sem).await;
+        run_dot_listener(dot_listener, dot_acceptor, dot_state, dot_sem).await;
     });
 
     let (doh_test_sock, active_doh_port) = bind_tcp(&host, requested_doh_port, 8443).await?;
     drop(doh_test_sock);
 
-    let doh_router = doh::build_doh_router(app_state.clone());
+    let doh_router = build_doh_router(app_state.clone());
     let doh_addr: std::net::SocketAddr = format!("{}:{}", host, active_doh_port).parse()?;
     let doh_handle = axum_server::Handle::new();
     let doh_handle_for_serve = doh_handle.clone();
@@ -277,13 +273,6 @@ async fn bind_tcp(
     }
 }
 
-/// Pre-warms the cache with canonical, client-agnostic validated DNS responses.
-///
-/// Stores canonical data under `{name}:{qtype}:IN` with all client-facing flags
-/// (ID, RD, CD, DO) cleared and explicit DNSSEC validation status populated.
-///
-/// Binds the cached TTL of Secure pre-warmed entries to the remaining RRSIG
-/// validity period per RFC 4035 §5.3.3, matching the exact behavior of runtime resolution.
 async fn preload_domains(
     cache: DnsCache,
     recursor: Arc<RecursiveResolver>,
@@ -321,7 +310,6 @@ async fn preload_domains(
 
             if let Ok(name) = Name::from_str(&fqdn) {
                 for qtype in [RecordType::A, RecordType::AAAA] {
-                    // Canonical, client-agnostic cache key matching src/engine.rs
                     let cache_key = format!("{}:{}:IN", name.to_ascii().to_lowercase(), qtype);
                     if cache_ref.contains_key(&cache_key) {
                         continue;
@@ -332,7 +320,6 @@ async fn preload_domains(
                             msg.response_code(),
                             ResponseCode::NoError | ResponseCode::NXDomain
                         ) {
-                            // Validate DNSSEC for the canonical response
                             let status = dnssec::DnssecValidator::validate_message(
                                 &recursor_ref,
                                 &msg,
@@ -341,14 +328,12 @@ async fn preload_domains(
                             )
                             .await;
 
-                            // Do NOT cache Bogus or transient InsecureUnknown states
                             if status == dnssec::DnssecStatus::Bogus
                                 || status == dnssec::DnssecStatus::InsecureUnknown
                             {
                                 continue;
                             }
 
-                            // Neutralize all client-specific header flags on the canonical cached response
                             msg.set_id(0);
                             msg.set_authoritative(false);
                             msg.set_recursion_available(true);
@@ -358,7 +343,6 @@ async fn preload_domains(
 
                             if let Ok(wire) = msg.to_bytes() {
                                 let now = now_secs();
-                                // RFC 4035 §5.3.3: Bound TTL to remaining signature validity
                                 let ttl = calculate_cache_ttl(&msg, status, now);
 
                                 cache_ref.insert(
@@ -368,7 +352,7 @@ async fn preload_domains(
                                         min_ttl: ttl,
                                         cached_at: now,
                                         last_revalidated_at: now,
-                                        dnssec_status: status, // Store explicit DNSSEC status directly
+                                        dnssec_status: status,
                                     },
                                 );
                                 warmed_ref.fetch_add(1, Ordering::Relaxed);

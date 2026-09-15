@@ -29,7 +29,6 @@ pub fn load_or_generate(
         return Ok(LoadedCert {
             certs,
             key,
-
             cert_file: cert_path.to_string(),
             key_file: key_path.to_string(),
         });
@@ -72,7 +71,6 @@ pub fn load_or_generate(
     Ok(LoadedCert {
         certs,
         key,
-
         cert_file: "selfsigned_cert.pem".to_string(),
         key_file: "selfsigned_key.pem".to_string(),
     })

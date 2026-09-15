@@ -116,7 +116,6 @@ pub fn load_cache_from_disk<P: AsRef<Path>>(cache: &DnsCache, path: P) {
                     let mut discarded_legacy = 0;
 
                     for (k, val) in raw_entries {
-                        // Discard legacy entries missing dnssec_status instead of guessing
                         let entry: CacheEntry = match serde_json::from_value(val) {
                             Ok(e) => e,
                             Err(_) => {

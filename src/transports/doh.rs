@@ -1,4 +1,5 @@
-// src/doh.rs
+// src/transports/doh.rs
+use crate::engine::limits::MAX_DOH_PAYLOAD;
 use crate::engine::{process_dns_query, AppState, ProcessOutcome};
 use axum::{
     body::Bytes,
@@ -11,8 +12,6 @@ use axum::{
 use base64::prelude::*;
 use serde::Deserialize;
 use std::net::{IpAddr, SocketAddr};
-
-const MAX_DOH_PAYLOAD: usize = 4096;
 
 #[derive(Deserialize)]
 pub struct DohQuery {
@@ -47,15 +46,12 @@ async fn handle_doh_options() -> Response {
     (StatusCode::OK, headers, ()).into_response()
 }
 
-/// RFC 8484 §4.1.1: DoH query using HTTP GET.
-/// The DNS query is base64url encoded in the `dns` query parameter.
 async fn handle_doh_get(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(params): Query<DohQuery>,
 ) -> Response {
-    // RFC 8484 §4.2.1: Verify Accept header if provided by the client
     if !is_acceptable_media_type(&headers) {
         return (
             StatusCode::NOT_ACCEPTABLE,
@@ -64,7 +60,6 @@ async fn handle_doh_get(
             .into_response();
     }
 
-    // Distinguish missing parameter vs empty parameter
     let encoded = match params.dns {
         None => return (StatusCode::BAD_REQUEST, "Missing 'dns' query parameter").into_response(),
         Some(ref d) if d.trim().is_empty() => {
@@ -73,7 +68,6 @@ async fn handle_doh_get(
         Some(ref d) => d.trim(),
     };
 
-    // Decode base64url DNS wire bytes
     let raw_bytes = match decode_dns_param(encoded) {
         Ok(b) if b.is_empty() => {
             return (StatusCode::BAD_REQUEST, "Empty decoded DNS query payload").into_response()
@@ -95,17 +89,12 @@ async fn handle_doh_get(
     handle_dns_outcome(outcome)
 }
 
-/// RFC 8484 §4.1.5: DoH query using HTTP POST.
-/// The DNS query is contained in binary wire format in the HTTP body,
-/// and the Content-Type header MUST be 'application/dns-message'.
 async fn handle_doh_post(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // RFC 8484 §4.1: POST requires Content-Type: application/dns-message.
-    // Check Content-Type first before examining payload content.
     let ct_valid = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -124,7 +113,6 @@ async fn handle_doh_post(
             .into_response();
     }
 
-    // RFC 8484 §4.2.1: Verify Accept header if provided
     if !is_acceptable_media_type(&headers) {
         return (
             StatusCode::NOT_ACCEPTABLE,
@@ -150,7 +138,6 @@ async fn handle_doh_post(
     handle_dns_outcome(outcome)
 }
 
-/// Checks whether the client's Accept header is compatible with application/dns-message.
 fn is_acceptable_media_type(headers: &HeaderMap) -> bool {
     if let Some(accept) = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()) {
         let accept = accept.trim().to_ascii_lowercase();
@@ -162,21 +149,14 @@ fn is_acceptable_media_type(headers: &HeaderMap) -> bool {
     }
 }
 
-/// Maps internal DNS engine outcomes to strict RFC 8484 HTTP responses.
 fn handle_dns_outcome(outcome: ProcessOutcome) -> Response {
     match outcome {
-        // RFC 8484 §4.2.1: Valid DNS messages (including SERVFAIL and truncated challenges)
-        // are returned as HTTP 200 OK with Content-Type: application/dns-message.
         ProcessOutcome::Success(wire)
         | ProcessOutcome::ServFail(wire)
         | ProcessOutcome::Truncated(wire) => make_dns_response(wire),
-
-        // Malformed or invalid DNS wire input returns HTTP 400 Bad Request.
         ProcessOutcome::Malformed => {
             (StatusCode::BAD_REQUEST, "Malformed or invalid DNS message").into_response()
         }
-
-        // Rate-limited queries return HTTP 429 Too Many Requests.
         ProcessOutcome::Dropped => {
             (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response()
         }
@@ -195,8 +175,6 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
-/// Resolves the originating client IP.
-/// Reverse proxy headers are only trusted if the connection originates from loopback (e.g. Nginx).
 fn extract_client_ip(headers: &HeaderMap, peer: &SocketAddr) -> IpAddr {
     if peer.ip().is_loopback() {
         if let Some(cf_ip) = headers
@@ -226,8 +204,6 @@ fn extract_client_ip(headers: &HeaderMap, peer: &SocketAddr) -> IpAddr {
     peer.ip()
 }
 
-/// Decodes base64url encoded DNS query parameter (RFC 4648 §5).
-/// Accepts unpadded (RFC 8484 compliant) and padded base64url inputs.
 fn decode_dns_param(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
     let s = input.trim().replace('-', "+").replace('_', "/");
     let pad_len = (4 - (s.len() % 4)) % 4;
