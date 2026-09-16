@@ -279,15 +279,16 @@ fn reconstruct_wildcard_name(owner: &Name, num_labels: u8) -> Option<Name> {
     // Build "*.<tail>" using from_labels, which preserves labels
     // with embedded dots exactly (it does not re-parse the ASCII
     // presentation form).
-    let mut parts: Vec<Vec<u8>> = Vec::with_capacity(tail.len() + 1);
-    parts.push(b"*".to_vec());
+    // Do NOT append an empty terminator — hickory's from_labels
+    // rejects empty label slices. The root label is implicit.
+    let mut parts: Vec<&[u8]> = Vec::with_capacity(tail.len() + 1);
+    parts.push(b"*");
     for label in tail {
         if label.len() > 63 {
             return None;
         }
-        parts.push(label.to_vec());
+        parts.push(label);
     }
-    parts.push(Vec::new()); // root label terminator
 
     Name::from_labels(parts).ok()
 }
