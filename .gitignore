@@ -19,3 +19,11 @@ Tests/dns_diff_tester/checkpoint.txt
 Tests/dns_diff_tester/diff_log.jsonl
 Tests/dns_diff_tester/diff_log.txt
 Tests/dns_diff_tester/retest_failed.py
+Tests/dns_diff_tester/dump_dnssec_chains.py
+Tests/dns_diff_tester/dnssec_chain_dump.json
+Tests/dns_diff_tester/dnssec_chain_dump.txt
+/Tests/dns_diff_tester/dnssec_diag
+Tests/dns_diff_tester/run_diagnose.sh
+Tests/dns_diff_tester/diagnose_domain.py
+Tests/dns_diff_tester/diag_dnssec_chain.sh
+/verify_test/target

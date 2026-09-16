@@ -58,7 +58,15 @@ impl DnssecValidator {
         qtype: RecordType,
     ) -> DnssecStatus {
         let mut budget = ValidationBudget::default();
-        Self::validate_message_with_budget(recursor, msg, qname, qtype, &mut budget).await
+
+        Self::validate_message_with_budget(
+            recursor,
+            msg,
+            qname,
+            qtype,
+            &mut budget,
+        )
+        .await
     }
 
     pub async fn validate_message_with_budget(
@@ -72,13 +80,24 @@ impl DnssecValidator {
             ResponseCode::NXDomain => {
                 validate_negative(recursor, msg, qname, qtype, budget).await
             }
+
             ResponseCode::NoError if msg.answers().is_empty() => {
                 validate_negative(recursor, msg, qname, qtype, budget).await
             }
+
             ResponseCode::NoError => {
                 let answers: Vec<Record> = msg.answers().to_vec();
-                Self::validate_answer(recursor, qname, qtype, &answers, budget).await
+
+                Self::validate_answer(
+                    recursor,
+                    qname,
+                    qtype,
+                    &answers,
+                    budget,
+                )
+                .await
             }
+
             _ => DnssecStatus::InsecureUnknown,
         }
     }
@@ -95,12 +114,22 @@ impl DnssecValidator {
         } else {
             match collect_redirection_chain(name, all_records) {
                 RedirectionChainResult::Complete(c) => c,
+
                 RedirectionChainResult::Loop => {
-                    tracing::warn!(name = %name, "[DNSSEC] Redirection cycle detected; Bogus");
+                    tracing::warn!(
+                        name = %name,
+                        "[DNSSEC] Redirection cycle detected; Bogus"
+                    );
+
                     return DnssecStatus::Bogus;
                 }
+
                 RedirectionChainResult::TooLong => {
-                    tracing::warn!(name = %name, "[DNSSEC] Redirection chain exceeded limit; Bogus");
+                    tracing::warn!(
+                        name = %name,
+                        "[DNSSEC] Redirection chain exceeded limit; Bogus"
+                    );
+
                     return DnssecStatus::Bogus;
                 }
             }
@@ -111,7 +140,10 @@ impl DnssecValidator {
                 RedirectionStep::Cname { owner, .. } => {
                     let cname_records: Vec<Record> = all_records
                         .iter()
-                        .filter(|r| r.name() == owner && r.record_type() == RecordType::CNAME)
+                        .filter(|r| {
+                            r.name() == owner
+                                && r.record_type() == RecordType::CNAME
+                        })
                         .cloned()
                         .collect();
 
@@ -130,9 +162,11 @@ impl DnssecValidator {
                     .await
                     {
                         DnssecStatus::Secure => {}
+
                         other => return other,
                     }
                 }
+
                 RedirectionStep::Dname {
                     dname_owner,
                     input_name,
@@ -140,7 +174,10 @@ impl DnssecValidator {
                 } => {
                     let dname_records: Vec<Record> = all_records
                         .iter()
-                        .filter(|r| r.name() == dname_owner && r.record_type() == DNAME_RECORD_TYPE)
+                        .filter(|r| {
+                            r.name() == dname_owner
+                                && r.record_type() == DNAME_RECORD_TYPE
+                        })
                         .cloned()
                         .collect();
 
@@ -159,19 +196,25 @@ impl DnssecValidator {
                     .await
                     {
                         DnssecStatus::Secure => {}
+
                         other => return other,
                     }
 
                     let synth_cname_records: Vec<Record> = all_records
                         .iter()
-                        .filter(|r| r.name() == input_name && r.record_type() == RecordType::CNAME)
+                        .filter(|r| {
+                            r.name() == input_name
+                                && r.record_type() == RecordType::CNAME
+                        })
                         .cloned()
                         .collect();
 
                     let has_rrsig = all_records.iter().any(|r| match r.data() {
                         RData::DNSSEC(DNSSECRData::RRSIG(sig)) => {
-                            sig.type_covered() == RecordType::CNAME && r.name() == input_name
+                            sig.type_covered() == RecordType::CNAME
+                                && r.name() == input_name
                         }
+
                         _ => false,
                     });
 
@@ -187,6 +230,7 @@ impl DnssecValidator {
                         .await
                         {
                             DnssecStatus::Secure => {}
+
                             other => return other,
                         }
                     }
@@ -196,15 +240,19 @@ impl DnssecValidator {
 
         let final_owner = match chain.last() {
             Some(RedirectionStep::Cname { target, .. }) => target.clone(),
+
             Some(RedirectionStep::Dname {
                 redirected_name, ..
             }) => redirected_name.clone(),
+
             None => name.clone(),
         };
 
         let target_records: Vec<Record> = all_records
             .iter()
-            .filter(|r| r.name() == &final_owner && r.record_type() == rtype)
+            .filter(|r| {
+                r.name() == &final_owner && r.record_type() == rtype
+            })
             .cloned()
             .collect();
 
@@ -216,6 +264,7 @@ impl DnssecValidator {
                 redirection_hops = chain.len(),
                 "[DNSSEC] No records of requested type at final owner; treating as Unknown"
             );
+
             return DnssecStatus::InsecureUnknown;
         }
 
@@ -238,19 +287,25 @@ impl DnssecValidator {
         all_records: &[Record],
         budget: &mut ValidationBudget,
     ) -> DnssecStatus {
-        let rrsigs: Vec<RRSIG> = all_records
+        /*
+         * Keep the complete RRSIG Records here.
+         *
+         * We need the complete Record later because Hickory's DNSSEC TBS
+         * builder requires the RRSIG record metadata as well as the RRSIG RDATA.
+         */
+        let rrsig_records: Vec<Record> = all_records
             .iter()
-            .filter_map(|r| match r.data() {
-                RData::DNSSEC(DNSSECRData::RRSIG(sig))
-                    if sig.type_covered() == rtype && r.name() == owner =>
-                {
-                    Some(sig.clone())
+            .filter(|record| match record.data() {
+                RData::DNSSEC(DNSSECRData::RRSIG(sig)) => {
+                    sig.type_covered() == rtype && record.name() == owner
                 }
-                _ => None,
+
+                _ => false,
             })
+            .cloned()
             .collect();
 
-        if rrsigs.is_empty() {
+        if rrsig_records.is_empty() {
             return match is_zone_signed(recursor, owner, budget).await {
                 ZoneSignedness::Signed => {
                     tracing::warn!(
@@ -258,22 +313,27 @@ impl DnssecValidator {
                         qtype = ?rtype,
                         "[DNSSEC] Missing RRSIG for RRset in signed zone; Bogus"
                     );
+
                     DnssecStatus::Bogus
                 }
+
                 ZoneSignedness::ProvenUnsigned => {
                     tracing::debug!(
                         owner = %owner,
                         qtype = ?rtype,
                         "[DNSSEC] No RRSIG and zone proven unsigned; Insecure"
                     );
+
                     DnssecStatus::InsecureUnsigned
                 }
+
                 ZoneSignedness::Unknown => {
                     tracing::warn!(
                         owner = %owner,
                         qtype = ?rtype,
                         "[DNSSEC] No RRSIG and zone signedness unknown; Insecure (uncacheable)"
                     );
+
                     DnssecStatus::InsecureUnknown
                 }
             };
@@ -281,8 +341,18 @@ impl DnssecValidator {
 
         let now = now_secs();
 
-        let mut candidates = Vec::new();
-        for rrsig in &rrsigs {
+        /*
+         * Store complete RRSIG Records rather than just RRSIG RDATA.
+         */
+        let mut candidates: Vec<Record> = Vec::new();
+
+        for rrsig_record in &rrsig_records {
+            let rrsig = match rrsig_record.data() {
+                RData::DNSSEC(DNSSECRData::RRSIG(sig)) => sig,
+
+                _ => continue,
+            };
+
             if !rrsig_time_valid(rrsig, now) {
                 tracing::debug!(
                     owner = %owner,
@@ -291,35 +361,65 @@ impl DnssecValidator {
                     now,
                     "[DNSSEC] Skipping RRSIG outside validity window"
                 );
+
                 continue;
             }
 
+            /*
+             * RFC 4035 requires the RRSIG signer name to identify the
+             * zone containing the covered RRset.
+             */
             let zone = rrsig.signer_name();
+
             if !zone.zone_of(owner) && zone != owner {
                 tracing::warn!(
                     owner = %owner,
                     signer = %zone,
                     "[DNSSEC] Skipping unauthorized signer for RRset"
                 );
+
                 continue;
             }
 
-            candidates.push(rrsig);
+            /*
+             * The RRSIG Labels field cannot exceed the number of labels
+             * in the covered owner name.
+             */
+            if rrsig.num_labels() > owner.num_labels() {
+                tracing::warn!(
+                    owner = %owner,
+                    signer = %zone,
+                    rrsig_labels = rrsig.num_labels(),
+                    owner_labels = owner.num_labels(),
+                    "[DNSSEC] RRSIG has more labels than covered owner; Bogus"
+                );
+
+                continue;
+            }
+
+            candidates.push(rrsig_record.clone());
         }
 
         if candidates.is_empty() {
             tracing::warn!(
                 owner = %owner,
                 qtype = ?rtype,
-                rrsig_count = rrsigs.len(),
+                rrsig_count = rrsig_records.len(),
                 "[DNSSEC] All RRSIGs were expired, not yet valid, or unauthorized; Bogus"
             );
+
             return DnssecStatus::Bogus;
         }
 
         let mut any_trusted_chain = false;
 
-        for rrsig in candidates {
+        for rrsig_record in candidates {
+            let rrsig = match rrsig_record.data() {
+                RData::DNSSEC(DNSSECRData::RRSIG(sig)) => sig,
+
+                _ => continue,
+            };
+
             let zone = rrsig.signer_name();
 
             match build_trust_chain(recursor, zone, budget).await {
@@ -327,25 +427,60 @@ impl DnssecValidator {
                     keys: trusted_keys, ..
                 } => {
                     any_trusted_chain = true;
+
+                    /*
+                     * Match the RRSIG key tag BEFORE consuming a crypto
+                     * validation budget slot. This prevents unrelated
+                     * DNSKEYs from exhausting the KeyTrap protection budget.
+                     */
                     for dnskey in &trusted_keys {
+                        let key_tag =
+                            compute_key_tag(dnskey).unwrap_or(u16::MAX);
+
+                        if key_tag != rrsig.key_tag() {
+                            continue;
+                        }
+
                         if !budget.can_check_sig() {
                             tracing::warn!(
                                 name = %owner,
                                 "[DNSSEC] Exceeded per-validation signature budget (KeyTrap protection); Bogus"
                             );
+
                             return DnssecStatus::Bogus;
                         }
 
-                        let key_tag = compute_key_tag(dnskey).unwrap_or(u16::MAX);
-                        let tag_match = key_tag == rrsig.key_tag();
-                        let sig_ok =
-                            tag_match && Self::verify_rrsig(rrsig, dnskey, owner, target_records);
+                        // Log the algorithm and key size once per
+                        // candidate so that any future regression in
+                        // legacy RSA/SHA-1 handling is easy to diagnose.
+                        let rrsig_alg = u8::from(rrsig.algorithm());
+                        let dnskey_alg =
+                            u8::from(dnskey.public_key().algorithm());
 
-                        if sig_ok {
+                        if rrsig_alg == 5 || rrsig_alg == 7 {
+                            let pk_len =
+                                dnskey.public_key().public_bytes().len();
+                            tracing::debug!(
+                                owner = %owner,
+                                rrsig_alg,
+                                dnskey_alg,
+                                key_tag,
+                                dnskey_pubkey_bytes = pk_len,
+                                "[DNSSEC] Attempting legacy RSA/SHA-1 verification"
+                            );
+                        }
+
+                        if Self::verify_rrsig(
+                            rrsig,
+                            dnskey,
+                            &rrsig_record,
+                            target_records,
+                        ) {
                             return DnssecStatus::Secure;
                         }
                     }
                 }
+
                 ChainResult::Unsigned { .. } => {
                     tracing::debug!(
                         signer = %zone,
@@ -353,6 +488,7 @@ impl DnssecValidator {
                         "[DNSSEC] Trust chain returned Unsigned for signer"
                     );
                 }
+
                 ChainResult::Bogus => {
                     return DnssecStatus::Bogus;
                 }
@@ -363,9 +499,10 @@ impl DnssecValidator {
             tracing::warn!(
                 owner = %owner,
                 qtype = ?rtype,
-                rrsig_count = rrsigs.len(),
+                rrsig_count = rrsig_records.len(),
                 "[DNSSEC] No RRSIG verified against a trusted chain; Bogus"
             );
+
             return DnssecStatus::Bogus;
         }
 
@@ -374,19 +511,27 @@ impl DnssecValidator {
             qtype = ?rtype,
             "[DNSSEC] Validation fell through all RRSIGs with unsigned chains; Insecure"
         );
+
         DnssecStatus::InsecureUnsigned
     }
 
-    pub fn verify_rrsig(rrsig: &RRSIG, dnskey: &DNSKEY, owner: &Name, records: &[Record]) -> bool {
+    pub fn verify_rrsig(
+        rrsig: &RRSIG,
+        dnskey: &DNSKEY,
+        rrsig_record: &Record,
+        records: &[Record],
+    ) -> bool {
         let now = now_secs();
+
         if !rrsig_time_valid(rrsig, now) {
             tracing::debug!(
-                owner = %owner,
+                owner = %rrsig_record.name(),
                 sig_exp = rrsig.sig_expiration().get(),
                 sig_inc = rrsig.sig_inception().get(),
                 now,
                 "[DNSSEC] RRSIG validity period violated"
             );
+
             return false;
         }
 
@@ -396,17 +541,26 @@ impl DnssecValidator {
                 dnskey_alg = ?dnskey.public_key().algorithm(),
                 "[DNSSEC] Algorithm mismatch between RRSIG and DNSKEY"
             );
+
             return false;
         }
 
-        let tbs = match build_tbs(rrsig, owner, records) {
+        let tbs = match build_tbs(rrsig_record, records) {
             Some(t) => t,
+
             None => {
-                tracing::debug!(owner = %owner, "[DNSSEC] Failed to build TBS for RRSIG");
+                tracing::debug!(
+                    owner = %rrsig_record.name(),
+                    "[DNSSEC] Failed to build TBS for RRSIG"
+                );
+
                 return false;
             }
         };
 
+        // Primary path: our own verify_signature(), which uses ring
+        // first and falls back to the pure-Rust rsa crate for
+        // algorithm 5 / 7 keys below ring's 2048-bit floor.
         if verify_signature(
             rrsig.algorithm(),
             dnskey.public_key().public_bytes(),
@@ -416,11 +570,28 @@ impl DnssecValidator {
             return true;
         }
 
-        dnskey.public_key().verify(&tbs, rrsig.sig()).is_ok()
+        // Secondary path: Hickory's own verify(). Kept for the
+        // algorithms Hickory does support, and as a safety net in case
+        // our dispatch misses a variant.
+        if dnskey.public_key().verify(&tbs, rrsig.sig()).is_ok() {
+            return true;
+        }
+
+        tracing::debug!(
+            owner = %rrsig_record.name(),
+            alg = ?rrsig.algorithm(),
+            key_tag = rrsig.key_tag(),
+            "[DNSSEC] Both verify paths rejected RRSIG"
+        );
+
+        false
     }
 }
 
-pub fn collect_redirection_chain(name: &Name, records: &[Record]) -> RedirectionChainResult {
+pub fn collect_redirection_chain(
+    name: &Name,
+    records: &[Record],
+) -> RedirectionChainResult {
     let mut chain = Vec::new();
     let mut current = name.clone();
     let mut seen: HashSet<Name> = HashSet::new();
@@ -429,6 +600,7 @@ pub fn collect_redirection_chain(name: &Name, records: &[Record]) -> Redirection
         if !seen.insert(current.clone()) {
             return RedirectionChainResult::Loop;
         }
+
         if chain.len() >= MAX_CNAME_CHAIN {
             return RedirectionChainResult::TooLong;
         }
@@ -439,6 +611,7 @@ pub fn collect_redirection_chain(name: &Name, records: &[Record]) -> Redirection
                     return Some(c.0.clone());
                 }
             }
+
             None
         });
 
@@ -447,6 +620,7 @@ pub fn collect_redirection_chain(name: &Name, records: &[Record]) -> Redirection
                 owner: current.clone(),
                 target: target.clone(),
             });
+
             current = target;
             continue;
         }
@@ -457,9 +631,16 @@ pub fn collect_redirection_chain(name: &Name, records: &[Record]) -> Redirection
                 && r.name() != &current
             {
                 let target = extract_dname_target(r)?;
-                let sub = dname_substitute(&current, r.name(), &target).ok()?;
+                let sub = dname_substitute(
+                    &current,
+                    r.name(),
+                    &target,
+                )
+                .ok()?;
+
                 return Some((r.name().clone(), target, sub));
             }
+
             None
         });
 
@@ -470,6 +651,7 @@ pub fn collect_redirection_chain(name: &Name, records: &[Record]) -> Redirection
                 input_name: current.clone(),
                 redirected_name: redirected_name.clone(),
             });
+
             current = redirected_name;
             continue;
         }

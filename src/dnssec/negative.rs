@@ -25,6 +25,7 @@ pub async fn validate_negative(
         .name_servers()
         .iter()
         .find(|r| matches!(r.data(), RData::SOA(_)));
+
     let zone = match soa {
         Some(r) => r.name().clone(),
         None => {
@@ -48,6 +49,7 @@ pub async fn validate_negative(
             }
         })
         .unwrap_or_else(|| qname.clone());
+
     if !zone.zone_of(&final_target)
         && zone != final_target
         && !zone.zone_of(qname)
@@ -98,6 +100,7 @@ pub async fn validate_negative(
     let has_nsec3 = authority
         .iter()
         .any(|r| r.record_type() == RecordType::NSEC3);
+
     if has_nsec3 {
         return validate_nsec3(&keys, &final_target, qtype, &authority, budget);
     }
@@ -105,6 +108,7 @@ pub async fn validate_negative(
     let has_nsec = authority
         .iter()
         .any(|r| r.record_type() == RecordType::NSEC);
+
     if has_nsec {
         return validate_nsec(&keys, &final_target, qtype, &authority, budget);
     }
@@ -114,6 +118,7 @@ pub async fn validate_negative(
         qname = %qname,
         "[DNSSEC] Signed zone negative response has no NSEC/NSEC3 proof; Bogus"
     );
+
     DnssecStatus::Bogus
 }
 
@@ -126,22 +131,27 @@ pub fn verify_negative_rrset(
     let owner = rec.name().clone();
     let rtype = rec.record_type();
 
-    let rrsigs: Vec<RRSIG> = authority
+    // Keep the complete RRSIG Records, not just the RRSIG RDATA.
+    //
+    // The complete Record is required by Hickory's DNSSEC TBS builder because
+    // the canonical signed data depends on the RRSIG owner/name metadata.
+    let rrsig_records: Vec<Record> = authority
         .iter()
-        .filter_map(|r| {
+        .filter(|r| {
             if r.name() != &owner {
-                return None;
+                return false;
             }
-            match r.data() {
-                RData::DNSSEC(DNSSECRData::RRSIG(sig)) if sig.type_covered() == rtype => {
-                    Some(sig.clone())
-                }
-                _ => None,
-            }
+
+            matches!(
+                r.data(),
+                RData::DNSSEC(DNSSECRData::RRSIG(sig))
+                    if sig.type_covered() == rtype
+            )
         })
+        .cloned()
         .collect();
 
-    if rrsigs.is_empty() {
+    if rrsig_records.is_empty() {
         return false;
     }
 
@@ -155,18 +165,34 @@ pub fn verify_negative_rrset(
         return false;
     }
 
-    for sig in &rrsigs {
+    for rrsig_record in &rrsig_records {
+        let sig = match rrsig_record.data() {
+            RData::DNSSEC(DNSSECRData::RRSIG(sig))
+                if sig.type_covered() == rtype =>
+            {
+                sig
+            }
+            _ => continue,
+        };
+
         for key in keys {
             if key.key_tag_matches(sig.key_tag()) {
                 if !budget.can_check_sig() {
                     return false;
                 }
-                if DnssecValidator::verify_rrsig(sig, key, &owner, &full_rrset) {
+
+                if DnssecValidator::verify_rrsig(
+                    sig,
+                    key,
+                    rrsig_record,
+                    &full_rrset,
+                ) {
                     return true;
                 }
             }
         }
     }
+
     false
 }
 
@@ -182,6 +208,7 @@ pub fn validate_nsec(
         .filter(|r| r.record_type() == RecordType::NSEC)
         .take(MAX_NEGATIVE_RECORDS)
         .collect();
+
     if nsec_records.is_empty() {
         return DnssecStatus::Bogus;
     }
@@ -228,6 +255,7 @@ pub fn validate_nsec3(
         .filter(|r| r.record_type() == RecordType::NSEC3)
         .take(MAX_NEGATIVE_RECORDS)
         .collect();
+
     if nsec3_records.is_empty() {
         return DnssecStatus::Bogus;
     }
@@ -236,6 +264,7 @@ pub fn validate_nsec3(
         RData::DNSSEC(DNSSECRData::NSEC3(n)) => n,
         _ => return DnssecStatus::Bogus,
     };
+
     let salt = first.salt().to_vec();
     let iterations = first.iterations();
     let algorithm = first.hash_algorithm();
@@ -244,6 +273,7 @@ pub fn validate_nsec3(
         tracing::warn!("[DNSSEC] Unsupported NSEC3 hash algorithm; Unknown");
         return DnssecStatus::InsecureUnknown;
     }
+
     if iterations > MAX_NSEC3_ITERATIONS {
         tracing::warn!(
             iterations,
@@ -299,6 +329,7 @@ pub fn validate_nsec3(
         if qtype == RecordType::DS {
             return DnssecStatus::Secure;
         }
+
         return DnssecStatus::Bogus;
     }
 
@@ -323,20 +354,27 @@ pub fn find_nsec_closest_encloser(qname: &Name, nsec_records: &[&Record]) -> Opt
     } else {
         qname.base_name()
     };
+
     let mut steps = 0usize;
+
     loop {
         steps += 1;
+
         if steps > MAX_CLOSEST_ENCLOSER_STEPS {
             return None;
         }
+
         if nsec_records.iter().any(|r| r.name() == &cur) {
             return Some(cur);
         }
+
         if cur.is_root() {
             break;
         }
+
         cur = cur.base_name();
     }
+
     None
 }
 
@@ -362,6 +400,7 @@ pub fn check_nsec_nodata(
             }
         }
     }
+
     None
 }
 
@@ -372,10 +411,15 @@ pub fn check_nsec_wildcard_nodata(
     nsec_records: &[&Record],
 ) -> Option<DnssecStatus> {
     let wildcard = wildcard_name(closest);
-    let wildcard_nsec = nsec_records.iter().find(|&&r| r.name() == &wildcard)?;
+
+    let wildcard_nsec = nsec_records
+        .iter()
+        .find(|&&r| r.name() == &wildcard)?;
+
     if let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = wildcard_nsec.data() {
         let has_type = nsec.type_bit_maps().any(|t| t == qtype);
         let has_cname = nsec.type_bit_maps().any(|t| t == RecordType::CNAME);
+
         if has_type || has_cname {
             return None;
         }
@@ -410,11 +454,13 @@ pub fn check_nsec_nxdomain(
             false
         }
     });
+
     if !qname_covered {
         return None;
     }
 
     let wildcard = wildcard_name(closest);
+
     let wildcard_covered = nsec_records.iter().any(|&rec| {
         if let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = rec.data() {
             nsec_covers(rec.name(), nsec.next_domain_name(), &wildcard)
@@ -422,6 +468,7 @@ pub fn check_nsec_nxdomain(
             false
         }
     });
+
     if !wildcard_covered {
         return None;
     }
@@ -437,23 +484,30 @@ pub fn find_nsec3_closest_provable_encloser(
 ) -> Option<Name> {
     let mut cur = qname.clone();
     let mut steps = 0usize;
+
     loop {
         steps += 1;
+
         if steps > MAX_CLOSEST_ENCLOSER_STEPS {
             return None;
         }
+
         let h = nsec3_hash(&cur, salt, iterations);
+
         if nsec3_records
             .iter()
             .any(|&r| nsec3_owner_hash(r).as_deref() == Some(h.as_slice()))
         {
             return Some(cur);
         }
+
         if cur.is_root() {
             break;
         }
+
         cur = cur.base_name();
     }
+
     None
 }
 
@@ -465,6 +519,7 @@ pub fn check_nsec3_nodata(
     iterations: u16,
 ) -> Option<DnssecStatus> {
     let hashed_qname = nsec3_hash(qname, salt, iterations);
+
     for &rec in nsec3_records {
         if nsec3_owner_hash(rec).as_deref() == Some(hashed_qname.as_slice()) {
             if let RData::DNSSEC(DNSSECRData::NSEC3(n)) = rec.data() {
@@ -482,6 +537,7 @@ pub fn check_nsec3_nodata(
             }
         }
     }
+
     None
 }
 
@@ -502,6 +558,7 @@ pub fn check_nsec3_wildcard_nodata(
     if let RData::DNSSEC(DNSSECRData::NSEC3(n)) = wildcard_rec.data() {
         let has_type = n.type_bit_maps().any(|t| t == qtype);
         let has_cname = n.type_bit_maps().any(|t| t == RecordType::CNAME);
+
         if has_type || has_cname {
             return None;
         }
@@ -521,13 +578,17 @@ pub fn check_nsec3_nxdomain(
     iterations: u16,
 ) -> Option<DnssecStatus> {
     let mut next_closer = qname.clone();
+
     while next_closer.base_name() != *closest {
         let parent = next_closer.base_name();
+
         if parent == next_closer {
             return Some(DnssecStatus::Bogus);
         }
+
         next_closer = parent;
     }
+
     let hashed_next = nsec3_hash(&next_closer, salt, iterations);
 
     let covering_rec = nsec3_records
@@ -545,11 +606,13 @@ pub fn check_nsec3_nxdomain(
             qtype = ?qtype,
             "[DNSSEC] Opt-Out NSEC3 covers next-closer for DS query; proves insecure delegation"
         );
+
         return Some(DnssecStatus::InsecureUnsigned);
     }
 
     let wildcard = wildcard_name(closest);
     let hashed_wildcard = nsec3_hash(&wildcard, salt, iterations);
+
     if !nsec3_records
         .iter()
         .any(|&r| nsec3_covers(r, &hashed_wildcard))
@@ -566,6 +629,7 @@ pub fn wildcard_name(closest: &Name) -> Name {
     } else {
         let base = closest.to_ascii();
         let base = base.trim_end_matches('.');
+
         Name::from_str(&format!("*.{}.", base)).unwrap_or_else(|_| Name::root())
     }
 }
@@ -586,9 +650,11 @@ pub fn nsec3_owner_hash(rec: &Record) -> Option<Vec<u8>> {
     let s = rec.name().to_string();
     let first_label = s.trim_end_matches('.').split('.').next()?;
     let hash = base32hex_decode(first_label)?;
+
     if hash.len() != 20 {
         return None;
     }
+
     Some(hash)
 }
 
@@ -597,10 +663,12 @@ pub fn nsec3_covers(rec: &Record, target_hash: &[u8]) -> bool {
         Some(h) => h,
         None => return false,
     };
+
     let next_hash: Vec<u8> = match rec.data() {
         RData::DNSSEC(DNSSECRData::NSEC3(n)) => n.next_hashed_owner_name().to_vec(),
         _ => return false,
     };
+
     if owner_hash.as_slice() <= next_hash.as_slice() {
         owner_hash.as_slice() <= target_hash && target_hash < next_hash.as_slice()
     } else {
@@ -610,14 +678,16 @@ pub fn nsec3_covers(rec: &Record, target_hash: &[u8]) -> bool {
 
 pub fn nsec3_hash(name: &Name, salt: &[u8], iterations: u16) -> Vec<u8> {
     let mut wire = Vec::new();
+
     for label in name.iter() {
         let bytes: &[u8] = label;
         wire.push(bytes.len() as u8);
         wire.extend_from_slice(&bytes.to_ascii_lowercase());
     }
-    wire.push(0);
 
+    wire.push(0);
     wire.extend_from_slice(salt);
+
     let mut hash = digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, &wire)
         .as_ref()
         .to_vec();
@@ -625,27 +695,34 @@ pub fn nsec3_hash(name: &Name, salt: &[u8], iterations: u16) -> Vec<u8> {
     for _ in 0..iterations {
         let mut d = hash.clone();
         d.extend_from_slice(salt);
+
         hash = digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, &d)
             .as_ref()
             .to_vec();
     }
+
     hash
 }
 
 pub fn base32hex_decode(s: &str) -> Option<Vec<u8>> {
     const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUV";
+
     let upper = s.to_ascii_uppercase();
     let mut bits: u64 = 0;
     let mut bit_count: u32 = 0;
     let mut out = Vec::new();
+
     for c in upper.bytes() {
         let val = ALPHABET.iter().position(|&x| x == c)? as u64;
+
         bits = (bits << 5) | val;
         bit_count += 5;
+
         if bit_count >= 8 {
             bit_count -= 8;
             out.push((bits >> bit_count) as u8);
         }
     }
+
     Some(out)
 }

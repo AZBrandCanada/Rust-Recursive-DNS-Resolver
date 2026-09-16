@@ -40,6 +40,8 @@ h3 = "0.0.8"
 h3-quinn = "0.0.10"
 bytes = "1.12.1"
 http = "1.5.0"
+rsa = { version = "0.9", features = ["sha2", "sha1"] }
+sha1 = "0.10"
 
 [profile.release]
 opt-level = 3
