@@ -2,52 +2,32 @@
 //
 // Manual DNSSEC TBS (To-Be-Signed) construction.
 //
-// hickory-proto 0.25.2's TBS::from_rrsig() is broken: it emits only
-// the RRSIG RDATA prefix and silently drops the RRset records, so the
-// resulting TBS is truncated (~26 bytes for uk.com instead of ~48).
-// Every signature verification fails regardless of algorithm or key
-// size.
+// Three hickory-proto 0.25.2 issues are corrected here:
 //
-// This module implements RFC 4034 §3.1.8.1 / RFC 4035 §5.3.2
-// directly.
+//   1. TBS::from_rrsig() emits only the RRSIG RDATA prefix and drops
+//      the RRset records entirely.
 //
-// Layout of the signed data:
+//   2. BinEncoder::set_canonical_names(true) does not cause
+//      Name::emit() to lowercase the emitted labels, contrary to
+//      RFC 4034 §6.2. Authoritative servers frequently send
+//      uppercase owner names (CMU.EDU., NSEC3 hashes like
+//      CK0POJMG...), which must be lowercased before hashing.
 //
-//   RRSIG_RDATA_without_signature || RR(1) || RR(2) || ...
-//
-// Where RRSIG_RDATA_without_signature is:
-//
-//   type_covered   (u16, network byte order)
-//   algorithm      (u8)
-//   labels         (u8)
-//   original_ttl   (u32, network byte order)
-//   expiration     (u32, network byte order)
-//   inception      (u32, network byte order)
-//   key_tag        (u16, network byte order)
-//   signer_name    (canonical, uncompressed wire format)
-//
-// And each RR(i) is:
-//
-//   owner_name     (canonical, uncompressed, wildcard-reconstructed)
-//   type           (u16, network byte order)
-//   class          (u16, network byte order)
-//   original_ttl   (u32, network byte order, from the RRSIG)
-//   rdata_length   (u16, network byte order)
-//   rdata          (canonical wire format)
-//
-// Records are sorted in canonical order (RFC 4034 §6.3) before being
-// appended.
+//   3. Name::eq in hickory-proto 0.25.2 is case-sensitive, contrary
+//      to RFC 4343. Authoritative servers can return mixed-case
+//      owner names within a single RRset, and a naive
+//      `r.name() == owner` filter drops half the records.
 
 use hickory_proto::dnssec::rdata::{DNSSECRData, RRSIG};
 use hickory_proto::rr::{Name, RData, Record};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 use std::str::FromStr;
 
-/// Build the DNSSEC TBS for an RRSIG over the given RRset.
-///
-/// Returns `None` if the RRSIG record cannot be parsed, the RRSIG
-/// Labels field is invalid for the owner name, or any record in the
-/// set does not match the RRSIG's type/class/name.
+/// Case-insensitive DNS name comparison (RFC 4343).
+fn name_eq(a: &Name, b: &Name) -> bool {
+    a.to_ascii().eq_ignore_ascii_case(&b.to_ascii())
+}
+
 pub fn build_tbs_manual(
     rrsig_record: &Record,
     records: &[Record],
@@ -70,8 +50,6 @@ pub fn build_tbs_manual(
     let type_covered = rrsig.type_covered();
     let num_labels = rrsig.num_labels();
 
-    // Count non-root labels. Name::iter() yields the root label as an
-    // empty slice, so filter it out.
     let owner_label_count = owner.iter().filter(|l| !l.is_empty()).count() as u8;
 
     if num_labels > owner_label_count {
@@ -92,25 +70,44 @@ pub fn build_tbs_manual(
         }
     };
 
+    tracing::debug!(
+        "[manual_tbs] owner={} signer={} type={:?} class={:?} labels={} input_records={}",
+        owner,
+        rrsig.signer_name(),
+        type_covered,
+        rrsig_class,
+        num_labels,
+        records.len(),
+    );
+
     let mut rrset: Vec<&Record> = records
         .iter()
         .filter(|r| {
-            r.name() == &owner
+            name_eq(r.name(), &owner)
                 && r.record_type() == type_covered
                 && r.dns_class() == rrsig_class
         })
         .collect();
 
+    tracing::debug!(
+        "[manual_tbs] rrset after filter: {} of {}",
+        rrset.len(),
+        records.len(),
+    );
+
     if rrset.is_empty() {
-        tracing::debug!(
-            owner = %owner,
-            qtype = ?type_covered,
-            "[manual_tbs] no records in RRset match RRSIG (name/type/class)"
-        );
+        for (i, r) in records.iter().enumerate() {
+            tracing::debug!(
+                "[manual_tbs]   miss[{}] name={} type={:?} class={:?}",
+                i,
+                r.name(),
+                r.record_type(),
+                r.dns_class(),
+            );
+        }
         return None;
     }
 
-    // Canonical sort by RDATA bytes (RFC 4034 §6.3).
     let mut sortable: Vec<(Vec<u8>, &Record)> = Vec::with_capacity(rrset.len());
     for r in rrset.drain(..) {
         let bytes = match canonical_rdata(r) {
@@ -132,7 +129,6 @@ pub fn build_tbs_manual(
 
     {
         let mut encoder = BinEncoder::new(&mut buf);
-        encoder.set_canonical_names(true);
 
         macro_rules! step {
             ($expr:expr) => {
@@ -157,10 +153,12 @@ pub fn build_tbs_manual(
         step!(encoder.emit_u32(rrsig.sig_expiration().get()));
         step!(encoder.emit_u32(rrsig.sig_inception().get()));
         step!(encoder.emit_u16(rrsig.key_tag()));
-        step!(rrsig.signer_name().emit(&mut encoder));
+
+        // Signer name in canonical (uncompressed, LOWERCASE) form.
+        step!(emit_name_canonical(rrsig.signer_name(), &mut encoder));
 
         for record in &rrset {
-            step!(canonical_owner.emit(&mut encoder));
+            step!(emit_name_canonical(&canonical_owner, &mut encoder));
             step!(encoder.emit_u16(u16::from(type_covered)));
             step!(encoder.emit_u16(u16::from(rrsig_class)));
             step!(encoder.emit_u32(rrsig.original_ttl()));
@@ -192,11 +190,43 @@ pub fn build_tbs_manual(
     Some(buf)
 }
 
+/// Emit a domain name in DNSSEC canonical wire format: uncompressed,
+/// length-prefixed, and lowercased per RFC 4034 §6.2.
+///
+/// Returns `Ok(())` to integrate with the `step!` macro above.
+/// Errors are surfaced as a synthetic `std::fmt::Error`, which the
+/// macro stringifies and logs.
+fn emit_name_canonical(
+    name: &Name,
+    encoder: &mut BinEncoder,
+) -> Result<(), std::fmt::Error> {
+    let ascii = name.to_ascii();
+    let trimmed = ascii.trim_end_matches('.');
+
+    if !trimmed.is_empty() {
+        for label in trimmed.split('.') {
+            let bytes = label.as_bytes();
+            if bytes.len() > 63 {
+                return Err(std::fmt::Error);
+            }
+            encoder.emit_u8(bytes.len() as u8).map_err(|_| std::fmt::Error)?;
+            for b in bytes {
+                encoder
+                    .emit_u8(b.to_ascii_lowercase())
+                    .map_err(|_| std::fmt::Error)?;
+            }
+        }
+    }
+    encoder.emit_u8(0).map_err(|_| std::fmt::Error)?;
+    Ok(())
+}
+
+/// Encode a record's RDATA. Leaf types (A, AAAA, DNSKEY, DS, NSEC3)
+/// contain no embedded domain names, so a plain emit is canonical.
 fn canonical_rdata(record: &Record) -> Option<Vec<u8>> {
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     {
         let mut encoder = BinEncoder::new(&mut buf);
-        encoder.set_canonical_names(true);
         record.data().emit(&mut encoder).ok()?;
     }
     Some(buf)

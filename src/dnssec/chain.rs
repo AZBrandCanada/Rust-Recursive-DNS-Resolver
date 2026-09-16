@@ -10,6 +10,11 @@ use hickory_proto::dnssec::PublicKey;
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use std::sync::OnceLock;
 
+/// Case-insensitive DNS name comparison (RFC 4343).
+pub fn name_eq(a: &Name, b: &Name) -> bool {
+    a.to_ascii().eq_ignore_ascii_case(&b.to_ascii())
+}
+
 pub const ROOT_TRUST_ANCHORS: &[(u16, u8, u8, &str)] = &[
     (
         20326,
@@ -132,7 +137,7 @@ pub async fn build_trust_chain(
             let ds_records: Vec<DS> = ds_msg
                 .answers()
                 .iter()
-                .filter(|r| r.name() == zone)
+                .filter(|r| name_eq(r.name(), zone))
                 .filter_map(|r| match r.data() {
                     RData::DNSSEC(DNSSECRData::DS(d)) => Some(d.clone()),
                     _ => None,
@@ -202,14 +207,11 @@ pub async fn build_trust_chain(
                 }
             }
 
-            // Keep the complete RRSIG Records here. The validator needs the
-            // owner name, class, TTL, and RRSIG RDATA to construct the exact
-            // DNSSEC signed data (TBS).
             let ds_rrsig_records: Vec<Record> = ds_msg
                 .answers()
                 .iter()
                 .filter(|r| {
-                    r.name() == zone
+                    name_eq(r.name(), zone)
                         && matches!(
                             r.data(),
                             RData::DNSSEC(DNSSECRData::RRSIG(s))
@@ -231,7 +233,7 @@ pub async fn build_trust_chain(
                 .answers()
                 .iter()
                 .filter(|r| {
-                    r.record_type() == RecordType::DS && r.name() == zone
+                    r.record_type() == RecordType::DS && name_eq(r.name(), zone)
                 })
                 .cloned()
                 .collect();
@@ -278,22 +280,6 @@ pub async fn build_trust_chain(
                 return ChainResult::Bogus;
             }
 
-            // Expand supported DS algorithms and digest types:
-            //
-            // Algorithms:
-            //   5  RSASHA1
-            //   7  RSASHA1-NSEC3-SHA1
-            //   8  RSASHA256
-            //   10 RSASHA512
-            //   13 ECDSAP256
-            //   14 ECDSAP384
-            //   15 ED25519
-            //   18 ML-DSA-44
-            //
-            // Digest types:
-            //   1 SHA-1
-            //   2 SHA-256
-            //   4 SHA-384
             let anchors: Vec<(u16, u8, u8, Vec<u8>)> = ds_records
                 .iter()
                 .filter_map(|d| {
@@ -350,7 +336,7 @@ pub async fn build_trust_chain(
         let candidates: Vec<DNSKEY> = dnskey_msg
             .answers()
             .iter()
-            .filter(|r| r.name() == zone)
+            .filter(|r| name_eq(r.name(), zone))
             .filter_map(|r| match r.data() {
                 RData::DNSSEC(DNSSECRData::DNSKEY(k)) => Some(k.clone()),
                 _ => None,
@@ -365,13 +351,11 @@ pub async fn build_trust_chain(
             return ChainResult::Bogus;
         }
 
-        // Keep the complete RRSIG Records rather than only extracting RRSIG
-        // RDATA. verify_rrsig() needs the original Record metadata.
         let dnskey_rrsig_records: Vec<Record> = dnskey_msg
             .answers()
             .iter()
             .filter(|r| {
-                r.name() == zone
+                name_eq(r.name(), zone)
                     && matches!(
                         r.data(),
                         RData::DNSSEC(DNSSECRData::RRSIG(s))
@@ -420,10 +404,18 @@ pub async fn build_trust_chain(
             .answers()
             .iter()
             .filter(|r| {
-                r.record_type() == RecordType::DNSKEY && r.name() == zone
+                r.record_type() == RecordType::DNSKEY && name_eq(r.name(), zone)
             })
             .cloned()
             .collect();
+
+        tracing::debug!(
+            zone = %zone,
+            full_records = dnskey_full_records.len(),
+            candidates = candidates.len(),
+            matched_keys = matched_keys.len(),
+            "[DNSSEC] DNSKEY RRset assembled for verification"
+        );
 
         let mut dnskey_verified = false;
 
@@ -511,7 +503,7 @@ pub async fn find_zone_apex(
     loop {
         if let Ok(msg) = recursor.resolve(&candidate, RecordType::SOA).await {
             for ans in msg.answers() {
-                if ans.name() == &candidate
+                if name_eq(ans.name(), &candidate)
                     && ans.record_type() == RecordType::SOA
                 {
                     return Some(candidate);
@@ -522,7 +514,7 @@ pub async fn find_zone_apex(
                 .answers()
                 .iter()
                 .any(|r| {
-                    r.name() == &candidate
+                    name_eq(r.name(), &candidate)
                         && r.record_type() == RecordType::CNAME
                 });
 
@@ -537,7 +529,7 @@ pub async fn find_zone_apex(
                     if matches!(rec.data(), RData::SOA(_)) {
                         let soa_name = rec.name();
 
-                        if soa_name == name || soa_name.zone_of(name) {
+                        if name_eq(soa_name, name) || soa_name.zone_of(name) {
                             let is_better = match &best_soa {
                                 Some(current) => {
                                     soa_name.num_labels() > current.num_labels()
@@ -575,8 +567,6 @@ pub async fn is_zone_signed(
 ) -> ZoneSignedness {
     let cache = signed_zone_cache();
 
-    // 1. Check cache: if any ancestor zone is ProvenUnsigned,
-    //    all descendants are ProvenUnsigned.
     let mut cur = name.clone();
 
     loop {
@@ -590,7 +580,7 @@ pub async fn is_zone_signed(
                     }
 
                     ZoneSignedness::Signed => {
-                        if cur == *name {
+                        if name_eq(&cur, name) {
                             return ZoneSignedness::Signed;
                         }
                     }
