@@ -1,0 +1,3 @@
+# dns_diff_tester/requirements.txt
+dnspython>=2.6.0
+requests>=2.31.0
