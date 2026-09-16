@@ -151,24 +151,12 @@ pub async fn build_trust_chain(
                     .iter()
                     .any(|r| r.record_type() == RecordType::NSEC3)
                 {
-                    validate_nsec3(
-                        parent_keys,
-                        zone,
-                        RecordType::DS,
-                        authority,
-                        budget,
-                    )
+                    validate_nsec3(parent_keys, zone, RecordType::DS, authority, budget)
                 } else if authority
                     .iter()
                     .any(|r| r.record_type() == RecordType::NSEC)
                 {
-                    validate_nsec(
-                        parent_keys,
-                        zone,
-                        RecordType::DS,
-                        authority,
-                        budget,
-                    )
+                    validate_nsec(parent_keys, zone, RecordType::DS, authority, budget)
                 } else {
                     DnssecStatus::Bogus
                 };
@@ -194,9 +182,7 @@ pub async fn build_trust_chain(
                             },
                         );
 
-                        return ChainResult::Unsigned {
-                            ttl: ds_proof_ttl,
-                        };
+                        return ChainResult::Unsigned { ttl: ds_proof_ttl };
                     }
 
                     DnssecStatus::Secure => {
@@ -251,9 +237,7 @@ pub async fn build_trust_chain(
             let ds_full_records: Vec<Record> = ds_msg
                 .answers()
                 .iter()
-                .filter(|r| {
-                    r.record_type() == RecordType::DS && name_eq(r.name(), zone)
-                })
+                .filter(|r| r.record_type() == RecordType::DS && name_eq(r.name(), zone))
                 .cloned()
                 .collect();
 
@@ -272,18 +256,12 @@ pub async fn build_trust_chain(
                 for key in parent_keys {
                     if key.key_tag_matches(rrsig.key_tag()) {
                         if !budget.can_check_sig() {
-                            tracing::warn!(
-                                "[DNSSEC] Work budget exhausted verifying DS; Bogus"
-                            );
+                            tracing::warn!("[DNSSEC] Work budget exhausted verifying DS; Bogus");
                             return ChainResult::Bogus;
                         }
 
-                        if DnssecValidator::verify_rrsig(
-                            rrsig,
-                            key,
-                            rrsig_record,
-                            &ds_full_records,
-                        ) {
+                        if DnssecValidator::verify_rrsig(rrsig, key, rrsig_record, &ds_full_records)
+                        {
                             ds_verified = true;
                             break 'ds;
                         }
@@ -305,8 +283,7 @@ pub async fn build_trust_chain(
                     let dt = u8::from(d.digest_type());
                     let alg = u8::from(d.algorithm());
 
-                    let alg_supported =
-                        matches!(alg, 5 | 7 | 8 | 10 | 13 | 14 | 15 | 18);
+                    let alg_supported = matches!(alg, 5 | 7 | 8 | 10 | 13 | 14 | 15 | 18);
 
                     if (dt == 1 || dt == 2 || dt == 4) && alg_supported {
                         Some((d.key_tag(), alg, dt, d.digest().to_vec()))
@@ -332,9 +309,7 @@ pub async fn build_trust_chain(
                     },
                 );
 
-                return ChainResult::Unsigned {
-                    ttl: ds_ttl,
-                };
+                return ChainResult::Unsigned { ttl: ds_ttl };
             }
 
             anchors
@@ -351,6 +326,28 @@ pub async fn build_trust_chain(
                 return ChainResult::Bogus;
             }
         };
+
+        // Diagnostic: dump every record in the raw DNSKEY response.
+        tracing::debug!(
+            zone = %zone,
+            rcode = ?dnskey_msg.response_code(),
+            truncated = dnskey_msg.truncated(),
+            answers = dnskey_msg.answers().len(),
+            authority = dnskey_msg.name_servers().len(),
+            additional = dnskey_msg.additionals().len(),
+            "[DNSSEC-DIAG] raw DNSKEY response"
+        );
+        for (i, r) in dnskey_msg.answers().iter().enumerate() {
+            tracing::debug!(
+                zone = %zone,
+                idx = i,
+                owner = %r.name(),
+                rtype = ?r.record_type(),
+                class = ?r.dns_class(),
+                ttl = r.ttl(),
+                "[DNSSEC-DIAG]   answer"
+            );
+        }
 
         // Diagnostic: dump every record in the raw DNSKEY response.
         tracing::debug!(
@@ -422,9 +419,7 @@ pub async fn build_trust_chain(
 
             for (tag, alg, digest_type, digest) in &trusted_ds {
                 if *tag == cand_tag && *alg == cand_alg {
-                    if let Some(computed) =
-                        compute_ds_digest(zone, cand, *digest_type)
-                    {
+                    if let Some(computed) = compute_ds_digest(zone, cand, *digest_type) {
                         if &computed == digest {
                             matched_keys.push(cand.clone());
                         }
@@ -444,9 +439,7 @@ pub async fn build_trust_chain(
         let dnskey_full_records: Vec<Record> = dnskey_msg
             .answers()
             .iter()
-            .filter(|r| {
-                r.record_type() == RecordType::DNSKEY && name_eq(r.name(), zone)
-            })
+            .filter(|r| r.record_type() == RecordType::DNSKEY && name_eq(r.name(), zone))
             .cloned()
             .collect();
 
@@ -473,18 +466,12 @@ pub async fn build_trust_chain(
             for key in &matched_keys {
                 if key.key_tag_matches(rrsig.key_tag()) {
                     if !budget.can_check_sig() {
-                        tracing::warn!(
-                            "[DNSSEC] Work budget exhausted verifying DNSKEY; Bogus"
-                        );
+                        tracing::warn!("[DNSSEC] Work budget exhausted verifying DNSKEY; Bogus");
                         return ChainResult::Bogus;
                     }
 
-                    if DnssecValidator::verify_rrsig(
-                        rrsig,
-                        key,
-                        rrsig_record,
-                        &dnskey_full_records,
-                    ) {
+                    if DnssecValidator::verify_rrsig(rrsig, key, rrsig_record, &dnskey_full_records)
+                    {
                         dnskey_verified = true;
                         break 'dk;
                     }
@@ -535,18 +522,13 @@ pub async fn build_trust_chain(
     }
 }
 
-pub async fn find_zone_apex(
-    recursor: &RecursiveResolver,
-    name: &Name,
-) -> Option<Name> {
+pub async fn find_zone_apex(recursor: &RecursiveResolver, name: &Name) -> Option<Name> {
     let mut candidate = name.clone();
 
     loop {
         if let Ok(msg) = recursor.resolve(&candidate, RecordType::SOA).await {
             for ans in msg.answers() {
-                if name_eq(ans.name(), &candidate)
-                    && ans.record_type() == RecordType::SOA
-                {
+                if name_eq(ans.name(), &candidate) && ans.record_type() == RecordType::SOA {
                     return Some(candidate);
                 }
             }
@@ -554,27 +536,18 @@ pub async fn find_zone_apex(
             let is_cname = msg
                 .answers()
                 .iter()
-                .any(|r| {
-                    name_eq(r.name(), &candidate)
-                        && r.record_type() == RecordType::CNAME
-                });
+                .any(|r| name_eq(r.name(), &candidate) && r.record_type() == RecordType::CNAME);
 
             if !is_cname {
                 let mut best_soa: Option<Name> = None;
 
-                for rec in msg
-                    .answers()
-                    .iter()
-                    .chain(msg.name_servers().iter())
-                {
+                for rec in msg.answers().iter().chain(msg.name_servers().iter()) {
                     if matches!(rec.data(), RData::SOA(_)) {
                         let soa_name = rec.name();
 
                         if name_eq(soa_name, name) || soa_name.zone_of(name) {
                             let is_better = match &best_soa {
-                                Some(current) => {
-                                    soa_name.num_labels() > current.num_labels()
-                                }
+                                Some(current) => soa_name.num_labels() > current.num_labels(),
                                 None => true,
                             };
 
@@ -649,20 +622,13 @@ pub async fn is_zone_signed(
         }
     };
 
-    let (signedness, proof_ttl) =
-        match build_trust_chain(recursor, &zone, budget).await {
-            ChainResult::Trusted { ttl, .. } => {
-                (ZoneSignedness::Signed, ttl)
-            }
+    let (signedness, proof_ttl) = match build_trust_chain(recursor, &zone, budget).await {
+        ChainResult::Trusted { ttl, .. } => (ZoneSignedness::Signed, ttl),
 
-            ChainResult::Unsigned { ttl } => {
-                (ZoneSignedness::ProvenUnsigned, ttl)
-            }
+        ChainResult::Unsigned { ttl } => (ZoneSignedness::ProvenUnsigned, ttl),
 
-            ChainResult::Bogus => {
-                (ZoneSignedness::Unknown, 0)
-            }
-        };
+        ChainResult::Bogus => (ZoneSignedness::Unknown, 0),
+    };
 
     if signedness != ZoneSignedness::Unknown {
         cache.insert(
