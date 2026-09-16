@@ -35,6 +35,11 @@ rustls-pemfile = "2.2"
 rustls-pki-types = "1.10"
 rcgen = "0.13"
 ml-dsa = "0.1"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+bytes = "1.12.1"
+http = "1.5.0"
 
 [profile.release]
 opt-level = 3

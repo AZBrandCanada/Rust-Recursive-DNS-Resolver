@@ -2,7 +2,7 @@
 
 A high-performance, lightweight, multi-protocol **iterative recursive DNS resolver written in Rust**.
 
-The server provides standard DNS over **UDP/TCP**, **DNS-over-TLS (DoT)**, and **DNS-over-HTTPS (DoH)** while resolving domains directly through the DNS hierarchy—from the root servers to authoritative nameservers—without forwarding queries to third-party recursive resolvers such as Google Public DNS, Cloudflare, or Quad9.
+The server provides standard DNS over **UDP/TCP**, **DNS-over-TLS (DoT)**, **DNS-over-QUIC (DoQ)**, **DNS-over-HTTPS (DoH)** (HTTP/1.1 and HTTP/2), and **DNS-over-HTTP/3 (DoH3)** (QUIC) while resolving domains directly through the DNS hierarchy—from the root servers to authoritative nameservers—without forwarding queries to third-party recursive resolvers such as Google Public DNS, Cloudflare, or Quad9.
 
 The resolver combines a client-independent canonical cache with full DNSSEC validation, authenticated positive and negative responses, DNSKEY/DS trust chains, NSEC/NSEC3 denial proofs, CNAME/DNAME processing, RFC 1982 DNSSEC time arithmetic, ML-DSA-44 DNSSEC verification, stale-answer handling, rate limiting, anti-amplification defenses, and SSRF-resistant iterative resolution.
 
@@ -19,8 +19,10 @@ The cache stores validated DNS data and its explicit DNSSEC security state. It d
 ```text
        UDP :53 ─────┐
        TCP :53 ─────┤
-      DoT :853 ─────┤
-      DoH :443 ─────┤
+  DoT TCP :853 ─────┤
+  DoQ UDP :853 ─────┤
+  DoH TCP :443 ─────┤
+ DoH3 UDP :443 ─────┤
       DoH :3053 ────┘
                      │
                      ▼
@@ -28,8 +30,10 @@ The cache stores validated DNS data and its explicit DNSSEC security state. It d
           ───────────────────────────
           • DNS UDP/TCP
           • RFC 7766 TCP framing
-          • RFC 7858 DoT
-          • RFC 8484 DoH
+          • RFC 7858 DoT (ALPN: dot)
+          • RFC 9250 DoQ (DNS over QUIC, ALPN: doq)
+          • RFC 8484 DoH (HTTP/1.1 & HTTP/2)
+          • RFC 9114 / RFC 9000 DoH3 (HTTP/3 over QUIC, ALPN: h3)
           • 65,535-byte UDP receive buffer
                      │
                      ▼
@@ -116,21 +120,33 @@ This avoids maintaining separate DO=0 and DO=1 caches and prevents one client's 
 
 ## Multi-Protocol Transport
 
-### Concurrent DNS, DoT, and DoH
+### Concurrent DNS, DoT, DoQ, DoH, and DoH3
 
 The server concurrently supports:
 
-* Plain DNS over UDP
-* Plain DNS over TCP
-* DNS-over-TLS on port 853
-* DNS-over-HTTPS on port 443
+* Plain DNS over UDP (port 53)
+* Plain DNS over TCP (port 53)
+* DNS-over-TLS on TCP port 853
+* DNS-over-QUIC on UDP port 853
+* DNS-over-HTTPS (HTTP/1.1 and HTTP/2) on TCP port 443
+* DNS-over-HTTP/3 (HTTP/3 over QUIC) on UDP port 443
 * Reverse-proxy DoH backend mode
 
 All transports eventually enter the same recursive resolution and validation engine.
 
-### RFC 8484 DoH
+### RFC 9250 DoQ (DNS-over-QUIC)
 
-The DoH implementation supports both standard RFC 8484 request forms:
+The resolver implements full RFC 9250 DNS-over-QUIC support:
+
+* Binds to UDP port 853 with ALPN `doq`
+* Processes individual queries over client-initiated bidirectional QUIC streams
+* Employs 2-octet length prefix framing per RFC 9250 §4.2
+* Returns RFC 9250 application reset codes (`0x2` for `DOQ_PROTOCOL_ERROR`, `0x4` for `DOQ_EXCESSIVE_LOAD`)
+* Eliminates Head-of-Line (HoL) blocking and supports 0-RTT connection resumption
+
+### RFC 8484 DoH (HTTP/1.1 & HTTP/2)
+
+The DoH implementation supports standard RFC 8484 request forms:
 
 * `GET` with a base64url-encoded `dns` parameter
 * `POST` with an `application/dns-message` body
@@ -144,6 +160,16 @@ HTTP request validation distinguishes protocol errors from DNS resolution errors
 * Incompatible `Accept` header → `406 Not Acceptable`
 * Rate-limited request → `429 Too Many Requests`
 * Valid DNS query producing `SERVFAIL` → `200 OK` with DNS wire response
+
+### RFC 9114 / RFC 9000 DoH3 (DNS-over-HTTP/3)
+
+The server implements native HTTP/3 transport over QUIC:
+
+* Binds to UDP port 443 with ALPN `h3`
+* Eliminates transport-layer Head-of-Line (HoL) blocking across multiplexed DNS queries
+* Supports 0-RTT session resumption and connection migration across client network transitions
+* Advertises HTTP/3 availability via `Alt-Svc: h3=":443"; ma=86400`
+* Shares the exact same request validation, canonical caching, and DNSSEC pipeline as DoH
 
 ### DNS TCP and DoT Framing
 
@@ -175,7 +201,7 @@ DoH can operate without local TLS using:
 DOH_NO_TLS=1
 ```
 
-This allows Nginx, Caddy, or another reverse proxy to terminate HTTPS while forwarding HTTP/1.1 traffic to the resolver.
+This allows Nginx, Caddy, Envoy, or another reverse proxy to terminate HTTPS/H3 while forwarding HTTP traffic to the resolver backend.
 
 ### Development Certificates
 
@@ -185,21 +211,26 @@ On Unix systems, generated private keys are protected with restrictive `0600` pe
 
 ### Unprivileged Port Fallback
 
-When privileged ports cannot be bound, the server automatically falls back to:
+When privileged ports cannot be bound (e.g., running without root or `CAP_NET_BIND_SERVICE`), the server automatically falls back to:
 
-| Service | Privileged | Fallback |
-| ------- | ---------: | -------: |
-| DNS     |         53 |     5053 |
-| DoT     |        853 |     8853 |
-| DoH     |        443 |     8443 |
+| Service | Transport | Privileged Port | Fallback Port | Environment Variable |
+| ------- | :-------: | --------------: | ------------: | -------------------- |
+| DNS     | UDP / TCP |              53 |          5053 | `DNS_PORT`           |
+| DoT     |    TCP    |             853 |          8853 | `DOT_PORT`           |
+| DoQ     |    UDP    |             853 |          8853 | `DOQ_PORT`           |
+| DoH     |    TCP    |             443 |          8443 | `DOH_PORT`           |
+| DoH3    |    UDP    |             443 |          8443 | `DOH3_PORT`          |
 
 ### Bounded Concurrency
 
 Tokio semaphores limit concurrent work to reduce resource exhaustion:
 
-* UDP: 2,048 permits
-* TCP: 512 permits
-* DoT: 512 permits
+* Plain UDP: 2,048 permits
+* Plain TCP: 512 permits
+* DoT (TCP): 512 permits
+* DoQ (QUIC/UDP): 512 permits
+* DoH (TCP): 512 permits
+* DoH3 (QUIC/UDP): 512 permits
 
 ---
 
@@ -779,13 +810,13 @@ Token acquisition uses atomic compare-and-update operations to avoid negative to
 
 ## Transport Isolation
 
-Connection-oriented transports—TCP, DoT, and DoH—use the subnet token bucket without UDP duplicate-domain penalties.
+Connection-oriented transports—TCP, DoT, DoQ, DoH, and DoH3—use the subnet token bucket without UDP duplicate-domain penalties.
 
-This avoids incorrectly penalizing legitimate pipelined DNS connections.
+This avoids incorrectly penalizing legitimate pipelined or multiplexed DNS connections.
 
 ## UDP Duplicate-Domain RRL
 
-UDP duplicate queries are tracked per domain and time epoch.
+UDP duplicate queries (plain DNS) are tracked per domain and time epoch.
 
 The policy is:
 
@@ -817,21 +848,23 @@ UDP `ANY` queries are dropped immediately to reduce their usefulness as amplific
 
 # Environment Variables
 
-| Variable             |         Default | Description                                                    |
-| -------------------- | --------------: | -------------------------------------------------------------- |
-| `HOST`               |       `0.0.0.0` | Bind address for listeners                                     |
-| `DNS_PORT`           |            `53` | Plain DNS port; falls back to `5053` when necessary            |
-| `DOT_PORT`           |           `853` | DNS-over-TLS port; falls back to `8853`                        |
-| `DOH_PORT`           |           `443` | DNS-over-HTTPS port; falls back to `8443`                      |
-| `DOH_NO_TLS`         |             `0` | Set to `1` when TLS is terminated by a reverse proxy           |
-| `DNSSEC_ENFORCE`     |             `1` | Return `SERVFAIL` when DNSSEC validation fails                 |
-| `MAX_STALE_SECS`     |           `300` | Maximum stale-serving window                                   |
-| `RATE_LIMIT_BURST`   |           `300` | Token-bucket burst capacity per client subnet                  |
-| `RATE_LIMIT_PER_SEC` |            `60` | Token-bucket refill rate per second                            |
-| `CERT_PATH`          | `fullchain.pem` | TLS certificate chain                                          |
-| `KEY_PATH`           |   `privkey.pem` | TLS private key                                                |
-| `WARM_LIMIT`         |             `0` | Number of Tranco domains to pre-warm; `0` disables pre-warming |
-| `WARM_CONCURRENCY`   |             `6` | Maximum concurrent pre-warming operations                      |
+| Variable             |         Default | Description                                                                  |
+| -------------------- | --------------: | ---------------------------------------------------------------------------- |
+| `HOST`               |       `0.0.0.0` | Bind address for all listeners                                               |
+| `DNS_PORT`           |            `53` | Plain DNS port (UDP and TCP); falls back to `5053` when unprivileged         |
+| `DOT_PORT`           |           `853` | DNS-over-TLS port (TCP); falls back to `8853` when unprivileged               |
+| `DOQ_PORT`           |           `853` | DNS-over-QUIC port (UDP); falls back to `8853` when unprivileged              |
+| `DOH_PORT`           |           `443` | DNS-over-HTTPS (HTTP/1.1 & HTTP/2) port (TCP); falls back to `8443`         |
+| `DOH3_PORT`          |           `443` | DNS-over-HTTP/3 (QUIC) port (UDP); falls back to `8443`                      |
+| `DOH_NO_TLS`         |             `0` | Set to `1` when TLS is terminated upstream by a reverse proxy                |
+| `DNSSEC_ENFORCE`     |             `1` | Return `SERVFAIL` when DNSSEC validation fails                               |
+| `MAX_STALE_SECS`     |           `300` | Maximum stale-serving window                                                 |
+| `RATE_LIMIT_BURST`   |           `300` | Token-bucket burst capacity per client subnet                                |
+| `RATE_LIMIT_PER_SEC` |            `60` | Token-bucket refill rate per second                                          |
+| `CERT_PATH`          | `fullchain.pem` | TLS certificate chain                                                        |
+| `KEY_PATH`           |   `privkey.pem` | TLS private key                                                              |
+| `WARM_LIMIT`         |             `0` | Number of Tranco domains to pre-warm; `0` disables pre-warming               |
+| `WARM_CONCURRENCY`   |             `6` | Maximum concurrent pre-warming operations                                    |
 
 ---
 
@@ -878,7 +911,7 @@ The resolver handles `TC=1` responses by retrying the query over TCP.
 
 ## Option A, Standalone Deployment
 
-The resolver can terminate DoT and DoH TLS directly.
+The resolver terminates DoT, DoQ, DoH (HTTP/1.1 and HTTP/2), and DoH3 (HTTP/3 over QUIC) directly.
 
 Example systemd service:
 
@@ -897,7 +930,9 @@ ExecStart=/usr/local/bin/doh-server
 Environment="HOST=0.0.0.0"
 Environment="DNS_PORT=53"
 Environment="DOT_PORT=853"
+Environment="DOQ_PORT=853"
 Environment="DOH_PORT=443"
+Environment="DOH3_PORT=443"
 Environment="DOH_NO_TLS=0"
 Environment="DNSSEC_ENFORCE=1"
 Environment="MAX_STALE_SECS=300"
@@ -928,22 +963,23 @@ sudo systemctl enable --now doh-server.service
 
 ## Option B, Reverse Proxy Deployment
 
-A reverse proxy can terminate public HTTPS while the resolver listens locally in HTTP mode.
+A reverse proxy can terminate public HTTPS and HTTP/3 while the resolver listens locally in unencrypted HTTP mode.
 
 Example architecture:
 
 ```text
 Internet
    │
-   ▼
-Nginx :443
+   ├─► Nginx :443 (TCP - HTTP/1.1 & HTTP/2)
    │
-   │ HTTP/1.1
-   ▼
-127.0.0.1:3053
-   │
-   ▼
-Unified DNS Resolver
+   └─► Nginx :443 (UDP - HTTP/3 / QUIC)
+         │
+         │ HTTP/1.1
+         ▼
+   127.0.0.1:3053
+         │
+         ▼
+   Unified DNS Resolver
 ```
 
 Configure:
@@ -962,8 +998,13 @@ upstream doh_backend {
 }
 
 server {
+    # HTTP/2 and HTTP/1.1 over TLS
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
+
+    # HTTP/3 over QUIC
+    listen 443 quic reuseport;
+    listen [::]:443 quic reuseport;
 
     server_name dns.example.com;
 
@@ -972,6 +1013,9 @@ server {
 
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers HIGH:!aNULL:!MD5;
+
+    # Advertise HTTP/3 support to connecting clients
+    add_header Alt-Svc 'h3=":443"; ma=86400' always;
 
     client_max_body_size 10k;
 
@@ -1014,13 +1058,19 @@ TCP:
 dig +tcp @127.0.0.1 -p 53 example.com A +dnssec
 ```
 
-## DNS-over-TLS
+## DNS-over-TLS (DoT)
 
 ```bash
 kdig -d @dns.example.com:853 +tls example.com A
 ```
 
-## DNS-over-HTTPS
+## DNS-over-QUIC (DoQ)
+
+```bash
+kdig -d @dns.example.com:853 +quic example.com A
+```
+
+## DNS-over-HTTPS (DoH)
 
 ### POST
 
@@ -1041,6 +1091,30 @@ echo -n "AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB" \
 curl -s \
   -H "Accept: application/dns-message" \
   "https://dns.example.com/dns-query?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB" \
+  | hexdump -C
+```
+
+## DNS-over-HTTP/3 (DoH3)
+
+### GET (HTTP/3 over QUIC)
+
+```bash
+curl --http3 -s \
+  -H "Accept: application/dns-message" \
+  "https://dns.example.com/dns-query?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB" \
+  | hexdump -C
+```
+
+### POST (HTTP/3 over QUIC)
+
+```bash
+echo -n "AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB" \
+  | base64 -d \
+  | curl --http3 -s -X POST \
+      --data-binary @- \
+      -H "Content-Type: application/dns-message" \
+      -H "Accept: application/dns-message" \
+      https://dns.example.com/dns-query \
   | hexdump -C
 ```
 
@@ -1097,6 +1171,7 @@ flags: ... ad ...
 | Legacy cache downgrade               | Entries without explicit DNSSEC state are discarded                                             |
 | Proxy identity spoofing              | Forwarded headers trusted only from loopback                                                    |
 | UDP application truncation           | 65,535-byte receive buffer                                                                      |
+| QUIC / HTTP/3 HoL blocking           | Multiplexed, independent byte streams per DNS query via QUIC                                    |
 | Post-quantum response truncation     | Automatic TCP retry after `TC=1`                                                                |
 
 ---

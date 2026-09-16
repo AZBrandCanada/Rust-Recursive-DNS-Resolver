@@ -204,7 +204,7 @@ fn extract_client_ip(headers: &HeaderMap, peer: &SocketAddr) -> IpAddr {
     peer.ip()
 }
 
-fn decode_dns_param(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
+pub fn decode_dns_param(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
     let s = input.trim().replace('-', "+").replace('_', "/");
     let pad_len = (4 - (s.len() % 4)) % 4;
     let padded = format!("{}{}", s, "=".repeat(pad_len));

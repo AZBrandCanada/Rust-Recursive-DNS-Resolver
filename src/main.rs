@@ -25,7 +25,11 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use transports::{build_doh_router, run_dot_listener, run_tcp_listener, run_udp_listener};
+use transports::quic::{bind_quic_endpoint, create_quic_server_config};
+use transports::{
+    build_doh_router, run_doh3_listener, run_doq_listener, run_dot_listener, run_tcp_listener,
+    run_udp_listener,
+};
 
 const CACHE_FILE: &str = "cache.json";
 const TRANCO_FILE: &str = "tranco_list.txt";
@@ -135,7 +139,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(853);
+    let requested_doq_port: u16 = std::env::var("DOQ_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(853);
     let requested_doh_port: u16 = std::env::var("DOH_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(443);
+    let requested_doh3_port: u16 = std::env::var("DOH3_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(443);
@@ -144,6 +156,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let udp_semaphore = Arc::new(Semaphore::new(2048));
     let tcp_semaphore = Arc::new(Semaphore::new(512));
     let dot_semaphore = Arc::new(Semaphore::new(512));
+    let doq_semaphore = Arc::new(Semaphore::new(512));
+    let doh3_semaphore = Arc::new(Semaphore::new(512));
 
     let (udp_socket, active_dns_port) = bind_udp(&host, requested_dns_port, 5053).await?;
     let udp_socket = Arc::new(udp_socket);
@@ -164,6 +178,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key_path = std::env::var("KEY_PATH").unwrap_or_else(|_| "privkey.pem".to_string());
     let loaded_cert = tls::load_or_generate(&cert_path, &key_path)?;
 
+    // DoT (TCP 853)
     let dot_tls_config = tls::dot_server_config(&loaded_cert)?;
     let dot_acceptor = TlsAcceptor::from(dot_tls_config);
     let (dot_listener, active_dot_port) = bind_tcp(&host, requested_dot_port, 8853).await?;
@@ -173,6 +188,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_dot_listener(dot_listener, dot_acceptor, dot_state, dot_sem).await;
     });
 
+    // DoQ (UDP 853 - RFC 9250)
+    let doq_server_config = create_quic_server_config(&loaded_cert, vec![b"doq".to_vec()])?;
+    let (doq_endpoint, active_doq_port) = bind_quic_endpoint(&host, requested_doq_port, 8853, doq_server_config)?;
+    let doq_state = app_state.clone();
+    let doq_sem = doq_semaphore.clone();
+    tokio::spawn(async move {
+        run_doq_listener(doq_endpoint, doq_state, doq_sem).await;
+    });
+
+    // DoH3 (UDP 443 - RFC 9114 / RFC 8484)
+    let doh3_server_config = create_quic_server_config(&loaded_cert, vec![b"h3".to_vec()])?;
+    let (doh3_endpoint, active_doh3_port) = bind_quic_endpoint(&host, requested_doh3_port, 8443, doh3_server_config)?;
+    let doh3_state = app_state.clone();
+    let doh3_sem = doh3_semaphore.clone();
+    tokio::spawn(async move {
+        run_doh3_listener(doh3_endpoint, doh3_state, doh3_sem).await;
+    });
+
+    // DoH (TCP 443)
     let (doh_test_sock, active_doh_port) = bind_tcp(&host, requested_doh_port, 8443).await?;
     drop(doh_test_sock);
 
@@ -185,7 +219,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(
             dns_port = active_dns_port,
             dot_port = active_dot_port,
+            doq_port = active_doq_port,
             doh_port = active_doh_port,
+            doh3_port = active_doh3_port,
             doh_mode = "plain HTTP",
             "[SERVER] All listeners active"
         );
@@ -201,7 +237,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(
             dns_port = active_dns_port,
             dot_port = active_dot_port,
+            doq_port = active_doq_port,
             doh_port = active_doh_port,
+            doh3_port = active_doh3_port,
             doh_mode = "HTTPS (TLS)",
             "[SERVER] All listeners active"
         );
