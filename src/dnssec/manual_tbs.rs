@@ -26,10 +26,7 @@ fn name_eq(a: &Name, b: &Name) -> bool {
     a.to_ascii().eq_ignore_ascii_case(&b.to_ascii())
 }
 
-pub fn build_tbs_manual(
-    rrsig_record: &Record,
-    records: &[Record],
-) -> Option<Vec<u8>> {
+pub fn build_tbs_manual(rrsig_record: &Record, records: &[Record]) -> Option<Vec<u8>> {
     let rrsig: &RRSIG = match rrsig_record.data() {
         RData::DNSSEC(DNSSECRData::RRSIG(s)) => s,
         _ => {
@@ -169,10 +166,7 @@ pub fn build_tbs_manual(
             let rdata_len = match u16::try_from(rdata.len()) {
                 Ok(n) => n,
                 Err(_) => {
-                    tracing::debug!(
-                        len = rdata.len(),
-                        "[manual_tbs] RDATA too long"
-                    );
+                    tracing::debug!(len = rdata.len(), "[manual_tbs] RDATA too long");
                     return None;
                 }
             };
@@ -192,10 +186,7 @@ pub fn build_tbs_manual(
 /// Uses `Name::iter()` to get the true label bytes. This is critical:
 /// labels can contain escaped dots (e.g. SOA rname `disa\.tinker`)
 /// which must be treated as single labels, not split on the dot.
-fn emit_name_canonical(
-    name: &Name,
-    encoder: &mut BinEncoder,
-) -> Result<(), std::fmt::Error> {
+fn emit_name_canonical(name: &Name, encoder: &mut BinEncoder) -> Result<(), std::fmt::Error> {
     for label in name.iter() {
         if label.is_empty() {
             // `Name::iter()` yields the root label as an empty slice.
@@ -205,7 +196,9 @@ fn emit_name_canonical(
         if label.len() > 63 {
             return Err(std::fmt::Error);
         }
-        encoder.emit_u8(label.len() as u8).map_err(|_| std::fmt::Error)?;
+        encoder
+            .emit_u8(label.len() as u8)
+            .map_err(|_| std::fmt::Error)?;
         for b in label {
             encoder
                 .emit_u8(b.to_ascii_lowercase())

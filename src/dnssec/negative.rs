@@ -168,11 +168,7 @@ pub fn verify_negative_rrset(
 
     for rrsig_record in &rrsig_records {
         let sig = match rrsig_record.data() {
-            RData::DNSSEC(DNSSECRData::RRSIG(sig))
-                if sig.type_covered() == rtype =>
-            {
-                sig
-            }
+            RData::DNSSEC(DNSSECRData::RRSIG(sig)) if sig.type_covered() == rtype => sig,
             _ => continue,
         };
 
@@ -182,12 +178,7 @@ pub fn verify_negative_rrset(
                     return false;
                 }
 
-                if DnssecValidator::verify_rrsig(
-                    sig,
-                    key,
-                    rrsig_record,
-                    &full_rrset,
-                ) {
+                if DnssecValidator::verify_rrsig(sig, key, rrsig_record, &full_rrset) {
                     return true;
                 }
             }
