@@ -18,3 +18,4 @@ test-dns2.sh
 Tests/dns_diff_tester/checkpoint.txt
 Tests/dns_diff_tester/diff_log.jsonl
 Tests/dns_diff_tester/diff_log.txt
+Tests/dns_diff_tester/retest_failed.py

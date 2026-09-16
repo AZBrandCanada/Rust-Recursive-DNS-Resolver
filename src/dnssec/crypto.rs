@@ -8,6 +8,7 @@ use ml_dsa::{
     EncodedSignature, EncodedVerifyingKey, MlDsa44, Signature as MlDsaSignature,
     VerifyingKey as MlDsaVerifyingKey,
 };
+use ring::digest;
 use ring::signature;
 use sha2::{Digest, Sha256, Sha384};
 use std::str::FromStr;
@@ -90,6 +91,7 @@ pub fn compute_ds_digest(owner: &Name, dnskey: &DNSKEY, digest_type: u8) -> Opti
         dnskey.emit(&mut encoder).ok()?;
     }
     match digest_type {
+        1 => Some(digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, &buf).as_ref().to_vec()),
         2 => Some(Sha256::digest(&buf).to_vec()),
         4 => Some(Sha384::digest(&buf).to_vec()),
         _ => None,
@@ -201,6 +203,22 @@ pub fn verify_signature(
     sig: &[u8],
 ) -> bool {
     match algorithm {
+        Algorithm::RSASHA1 | Algorithm::RSASHA1NSEC3SHA1 => {
+            let Some((exponent, modulus)) = parse_rsa_public_key(pubkey_bytes) else {
+                return false;
+            };
+            let components = signature::RsaPublicKeyComponents {
+                n: modulus,
+                e: exponent,
+            };
+            components
+                .verify(
+                    &signature::RSA_PKCS1_2048_8192_SHA1_FOR_LEGACY_USE_ONLY,
+                    message,
+                    sig,
+                )
+                .is_ok()
+        }
         Algorithm::RSASHA256 | Algorithm::RSASHA512 => {
             let Some((exponent, modulus)) = parse_rsa_public_key(pubkey_bytes) else {
                 return false;
@@ -284,7 +302,7 @@ pub fn parse_rsa_public_key(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
         return None;
     }
     let (exponent, modulus) = rest.split_at(exp_len);
-    if modulus.is_empty() || modulus.len() < 256 || modulus.len() > 1024 {
+    if modulus.is_empty() || modulus.len() < 128 || modulus.len() > 1024 {
         return None;
     }
     Some((exponent, modulus))

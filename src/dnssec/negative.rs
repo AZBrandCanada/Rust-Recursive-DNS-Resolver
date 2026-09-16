@@ -293,7 +293,12 @@ pub fn validate_nsec3(
         None => return DnssecStatus::Bogus,
     };
 
+    // RFC 5155 §8.6: For DS queries, if closest matches qname, the child delegation cut
+    // exists in the parent zone and lacks a DS record (proving insecure delegation).
     if closest == *qname {
+        if qtype == RecordType::DS {
+            return DnssecStatus::Secure;
+        }
         return DnssecStatus::Bogus;
     }
 

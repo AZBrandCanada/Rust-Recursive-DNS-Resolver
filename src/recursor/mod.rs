@@ -284,8 +284,14 @@ impl RecursiveResolver {
                     }
                 }
 
-                if response.response_code() == ResponseCode::NXDomain && response.authoritative() {
-                    return Ok(response);
+                // RFC 2181 §6.1: An authoritative response (AA=1) is never a referral.
+                // Both NXDomain and empty NoError (NODATA) must terminate recursion cleanly.
+                if response.authoritative() {
+                    if response.response_code() == ResponseCode::NXDomain
+                        || response.response_code() == ResponseCode::NoError
+                    {
+                        return Ok(response);
+                    }
                 }
 
                 // 3. Referral processing

@@ -158,6 +158,13 @@ pub async fn build_trust_chain(
                             zone = %zone,
                             "[DNSSEC] Authenticated denial of DS verified: zone is Insecure"
                         );
+                        signed_zone_cache().insert(
+                            zone.to_string().to_lowercase(),
+                            SignedZoneEntry {
+                                signedness: ZoneSignedness::ProvenUnsigned,
+                                expires_at: now_secs() + ds_proof_ttl.min(86400) as u64,
+                            },
+                        );
                         return ChainResult::Unsigned { ttl: ds_proof_ttl };
                     }
                     _ => {
@@ -218,14 +225,18 @@ pub async fn build_trust_chain(
                 return ChainResult::Bogus;
             }
 
+            // Expand supported DS algorithms and digest types:
+            // Algorithms: 5 (RSASHA1), 7 (RSASHA1-NSEC3-SHA1), 8 (RSASHA256), 10 (RSASHA512),
+            //             13 (ECDSAP256), 14 (ECDSAP384), 15 (ED25519), 18 (ML-DSA-44)
+            // Digest types: 1 (SHA-1), 2 (SHA-256), 4 (SHA-384)
             let anchors: Vec<(u16, u8, u8, Vec<u8>)> = ds_records
                 .iter()
                 .filter_map(|d| {
                     let dt = u8::from(d.digest_type());
                     let alg = u8::from(d.algorithm());
-                    let alg_supported = matches!(alg, 8 | 10 | 13 | 14 | 15 | 18);
+                    let alg_supported = matches!(alg, 5 | 7 | 8 | 10 | 13 | 14 | 15 | 18);
 
-                    if (dt == 2 || dt == 4) && alg_supported {
+                    if (dt == 1 || dt == 2 || dt == 4) && alg_supported {
                         Some((d.key_tag(), alg, dt, d.digest().to_vec()))
                     } else {
                         None
@@ -237,7 +248,14 @@ pub async fn build_trust_chain(
                 let ds_ttl = calculate_min_ttl(&ds_msg);
                 tracing::warn!(
                     zone = %zone,
-                    "[DNSSEC] DS RRset has no supported SHA-256 or SHA-384 digests; Unsigned"
+                    "[DNSSEC] DS RRset has no supported digest/algorithm anchors; Unsigned"
+                );
+                signed_zone_cache().insert(
+                    zone.to_string().to_lowercase(),
+                    SignedZoneEntry {
+                        signedness: ZoneSignedness::ProvenUnsigned,
+                        expires_at: now_secs() + ds_ttl.min(86400) as u64,
+                    },
                 );
                 return ChainResult::Unsigned { ttl: ds_ttl };
             }
@@ -432,6 +450,7 @@ pub async fn is_zone_signed(
 ) -> ZoneSignedness {
     let cache = signed_zone_cache();
 
+    // 1. Check cache: if any ancestor zone is ProvenUnsigned, all descendants are ProvenUnsigned.
     let mut cur = name.clone();
     loop {
         let key = cur.to_string().to_lowercase();
