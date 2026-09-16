@@ -163,11 +163,7 @@ pub fn verify_negative_rrset(
 
     for rrsig_record in &rrsig_records {
         let sig = match rrsig_record.data() {
-            RData::DNSSEC(DNSSECRData::RRSIG(sig))
-                if sig.type_covered() == rtype =>
-            {
-                sig
-            }
+            RData::DNSSEC(DNSSECRData::RRSIG(sig)) if sig.type_covered() == rtype => sig,
             _ => continue,
         };
 
@@ -177,12 +173,7 @@ pub fn verify_negative_rrset(
                     return false;
                 }
 
-                if DnssecValidator::verify_rrsig(
-                    sig,
-                    key,
-                    rrsig_record,
-                    &full_rrset,
-                ) {
+                if DnssecValidator::verify_rrsig(sig, key, rrsig_record, &full_rrset) {
                     return true;
                 }
             }
@@ -415,9 +406,7 @@ pub fn check_nsec_wildcard_nodata(
 ) -> Option<DnssecStatus> {
     let wildcard = wildcard_name(closest);
 
-    let wildcard_nsec = nsec_records
-        .iter()
-        .find(|&&r| r.name() == &wildcard)?;
+    let wildcard_nsec = nsec_records.iter().find(|&&r| r.name() == &wildcard)?;
 
     if let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = wildcard_nsec.data() {
         let has_type = nsec.type_bit_maps().any(|t| t == qtype);

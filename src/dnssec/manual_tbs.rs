@@ -28,10 +28,7 @@ fn name_eq(a: &Name, b: &Name) -> bool {
     a.to_ascii().eq_ignore_ascii_case(&b.to_ascii())
 }
 
-pub fn build_tbs_manual(
-    rrsig_record: &Record,
-    records: &[Record],
-) -> Option<Vec<u8>> {
+pub fn build_tbs_manual(rrsig_record: &Record, records: &[Record]) -> Option<Vec<u8>> {
     let rrsig: &RRSIG = match rrsig_record.data() {
         RData::DNSSEC(DNSSECRData::RRSIG(s)) => s,
         _ => {
@@ -173,10 +170,7 @@ pub fn build_tbs_manual(
             let rdata_len = match u16::try_from(rdata.len()) {
                 Ok(n) => n,
                 Err(_) => {
-                    tracing::debug!(
-                        len = rdata.len(),
-                        "[manual_tbs] RDATA too long"
-                    );
+                    tracing::debug!(len = rdata.len(), "[manual_tbs] RDATA too long");
                     return None;
                 }
             };
@@ -196,10 +190,7 @@ pub fn build_tbs_manual(
 /// Returns `Ok(())` to integrate with the `step!` macro above.
 /// Errors are surfaced as a synthetic `std::fmt::Error`, which the
 /// macro stringifies and logs.
-fn emit_name_canonical(
-    name: &Name,
-    encoder: &mut BinEncoder,
-) -> Result<(), std::fmt::Error> {
+fn emit_name_canonical(name: &Name, encoder: &mut BinEncoder) -> Result<(), std::fmt::Error> {
     let ascii = name.to_ascii();
     let trimmed = ascii.trim_end_matches('.');
 
@@ -209,7 +200,9 @@ fn emit_name_canonical(
             if bytes.len() > 63 {
                 return Err(std::fmt::Error);
             }
-            encoder.emit_u8(bytes.len() as u8).map_err(|_| std::fmt::Error)?;
+            encoder
+                .emit_u8(bytes.len() as u8)
+                .map_err(|_| std::fmt::Error)?;
             for b in bytes {
                 encoder
                     .emit_u8(b.to_ascii_lowercase())

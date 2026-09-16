@@ -1,8 +1,7 @@
 // src/dnssec/validator.rs
 use super::chain::{build_trust_chain, is_zone_signed, ChainResult, ZoneSignedness};
 use super::crypto::{
-    build_tbs, compute_key_tag, rrsig_time_valid, verify_signature,
-    ValidationBudget,
+    build_tbs, compute_key_tag, rrsig_time_valid, verify_signature, ValidationBudget,
 };
 use super::negative::validate_negative;
 use crate::cache::now_secs;
@@ -59,14 +58,7 @@ impl DnssecValidator {
     ) -> DnssecStatus {
         let mut budget = ValidationBudget::default();
 
-        Self::validate_message_with_budget(
-            recursor,
-            msg,
-            qname,
-            qtype,
-            &mut budget,
-        )
-        .await
+        Self::validate_message_with_budget(recursor, msg, qname, qtype, &mut budget).await
     }
 
     pub async fn validate_message_with_budget(
@@ -77,9 +69,7 @@ impl DnssecValidator {
         budget: &mut ValidationBudget,
     ) -> DnssecStatus {
         match msg.response_code() {
-            ResponseCode::NXDomain => {
-                validate_negative(recursor, msg, qname, qtype, budget).await
-            }
+            ResponseCode::NXDomain => validate_negative(recursor, msg, qname, qtype, budget).await,
 
             ResponseCode::NoError if msg.answers().is_empty() => {
                 validate_negative(recursor, msg, qname, qtype, budget).await
@@ -88,14 +78,7 @@ impl DnssecValidator {
             ResponseCode::NoError => {
                 let answers: Vec<Record> = msg.answers().to_vec();
 
-                let status = Self::validate_answer(
-                    recursor,
-                    qname,
-                    qtype,
-                    &answers,
-                    budget,
-                )
-                .await;
+                let status = Self::validate_answer(recursor, qname, qtype, &answers, budget).await;
 
                 // RFC 5155 §8.8: a wildcard-expanded answer in an
                 // NSEC3 zone is only provably Secure if the response
@@ -120,15 +103,11 @@ impl DnssecValidator {
 
     /// Detect wildcard-expanded answers in NSEC3 opt-out zones and
     /// downgrade them from Secure to InsecureUnknown.
-    fn wildcard_optout_check(
-        msg: &Message,
-        answers: &[Record],
-    ) -> Option<DnssecStatus> {
+    fn wildcard_optout_check(msg: &Message, answers: &[Record]) -> Option<DnssecStatus> {
         // Is any answer RRSIG a wildcard RRSIG?
         let has_wildcard_rrsig = answers.iter().any(|r| {
             if let RData::DNSSEC(DNSSECRData::RRSIG(sig)) = r.data() {
-                let owner_labels =
-                    r.name().iter().filter(|l| !l.is_empty()).count() as u8;
+                let owner_labels = r.name().iter().filter(|l| !l.is_empty()).count() as u8;
                 sig.num_labels() < owner_labels
             } else {
                 false
@@ -216,10 +195,7 @@ impl DnssecValidator {
                 RedirectionStep::Cname { owner, .. } => {
                     let cname_records: Vec<Record> = all_records
                         .iter()
-                        .filter(|r| {
-                            r.name() == owner
-                                && r.record_type() == RecordType::CNAME
-                        })
+                        .filter(|r| r.name() == owner && r.record_type() == RecordType::CNAME)
                         .cloned()
                         .collect();
 
@@ -250,10 +226,7 @@ impl DnssecValidator {
                 } => {
                     let dname_records: Vec<Record> = all_records
                         .iter()
-                        .filter(|r| {
-                            r.name() == dname_owner
-                                && r.record_type() == DNAME_RECORD_TYPE
-                        })
+                        .filter(|r| r.name() == dname_owner && r.record_type() == DNAME_RECORD_TYPE)
                         .cloned()
                         .collect();
 
@@ -278,17 +251,13 @@ impl DnssecValidator {
 
                     let synth_cname_records: Vec<Record> = all_records
                         .iter()
-                        .filter(|r| {
-                            r.name() == input_name
-                                && r.record_type() == RecordType::CNAME
-                        })
+                        .filter(|r| r.name() == input_name && r.record_type() == RecordType::CNAME)
                         .cloned()
                         .collect();
 
                     let has_rrsig = all_records.iter().any(|r| match r.data() {
                         RData::DNSSEC(DNSSECRData::RRSIG(sig)) => {
-                            sig.type_covered() == RecordType::CNAME
-                                && r.name() == input_name
+                            sig.type_covered() == RecordType::CNAME && r.name() == input_name
                         }
 
                         _ => false,
@@ -326,9 +295,7 @@ impl DnssecValidator {
 
         let target_records: Vec<Record> = all_records
             .iter()
-            .filter(|r| {
-                r.name() == &final_owner && r.record_type() == rtype
-            })
+            .filter(|r| r.name() == &final_owner && r.record_type() == rtype)
             .cloned()
             .collect();
 
@@ -488,8 +455,7 @@ impl DnssecValidator {
                     any_trusted_chain = true;
 
                     for dnskey in &trusted_keys {
-                        let key_tag =
-                            compute_key_tag(dnskey).unwrap_or(u16::MAX);
+                        let key_tag = compute_key_tag(dnskey).unwrap_or(u16::MAX);
 
                         if key_tag != rrsig.key_tag() {
                             continue;
@@ -504,12 +470,7 @@ impl DnssecValidator {
                             return DnssecStatus::Bogus;
                         }
 
-                        if Self::verify_rrsig(
-                            rrsig,
-                            dnskey,
-                            &rrsig_record,
-                            target_records,
-                        ) {
+                        if Self::verify_rrsig(rrsig, dnskey, &rrsig_record, target_records) {
                             return DnssecStatus::Secure;
                         }
                     }
@@ -616,10 +577,7 @@ impl DnssecValidator {
     }
 }
 
-pub fn collect_redirection_chain(
-    name: &Name,
-    records: &[Record],
-) -> RedirectionChainResult {
+pub fn collect_redirection_chain(name: &Name, records: &[Record]) -> RedirectionChainResult {
     let mut chain = Vec::new();
     let mut current = name.clone();
     let mut seen: HashSet<Name> = HashSet::new();
@@ -659,12 +617,7 @@ pub fn collect_redirection_chain(
                 && r.name() != &current
             {
                 let target = extract_dname_target(r)?;
-                let sub = dname_substitute(
-                    &current,
-                    r.name(),
-                    &target,
-                )
-                .ok()?;
+                let sub = dname_substitute(&current, r.name(), &target).ok()?;
 
                 return Some((r.name().clone(), target, sub));
             }
