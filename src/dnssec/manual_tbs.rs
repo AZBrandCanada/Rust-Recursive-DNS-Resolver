@@ -2,33 +2,34 @@
 //
 // Manual DNSSEC TBS (To-Be-Signed) construction.
 //
-// Three hickory-proto 0.25.2 issues are corrected here:
+// Two hickory-proto 0.25.2 issues are corrected here:
 //
 //   1. TBS::from_rrsig() emits only the RRSIG RDATA prefix and drops
 //      the RRset records entirely.
 //
-//   2. BinEncoder::set_canonical_names(true) does not cause
-//      Name::emit() to lowercase the emitted labels, contrary to
-//      RFC 4034 §6.2. Authoritative servers frequently send
-//      uppercase owner names (CMU.EDU., NSEC3 hashes like
-//      CK0POJMG...), which must be lowercased before hashing.
+//   2. BinEncoder::set_canonical_names(true) does not lowercase
+//      emitted labels. RFC 4034 §6.2 requires all names in the
+//      canonical signed data to be lowercased, including names
+//      embedded in RDATA (SOA mname/rname, CNAME, NS, MX, etc.).
 //
-//   3. Name::eq in hickory-proto 0.25.2 is case-sensitive, contrary
-//      to RFC 4343. Authoritative servers can return mixed-case
-//      owner names within a single RRset, and a naive
-//      `r.name() == owner` filter drops half the records.
+// All Name emission is done via Name::iter(), which yields the raw
+// label bytes with escape sequences already resolved. Do NOT use
+// to_ascii().split('.') — that breaks on labels containing escaped
+// dots (e.g. SOA rname fields like `disa\.tinker\.ie\.list\.dci`).
 
 use hickory_proto::dnssec::rdata::{DNSSECRData, RRSIG};
 use hickory_proto::rr::{Name, RData, Record};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
-use std::str::FromStr;
 
 /// Case-insensitive DNS name comparison (RFC 4343).
 fn name_eq(a: &Name, b: &Name) -> bool {
     a.to_ascii().eq_ignore_ascii_case(&b.to_ascii())
 }
 
-pub fn build_tbs_manual(rrsig_record: &Record, records: &[Record]) -> Option<Vec<u8>> {
+pub fn build_tbs_manual(
+    rrsig_record: &Record,
+    records: &[Record],
+) -> Option<Vec<u8>> {
     let rrsig: &RRSIG = match rrsig_record.data() {
         RData::DNSSEC(DNSSECRData::RRSIG(s)) => s,
         _ => {
@@ -150,8 +151,6 @@ pub fn build_tbs_manual(rrsig_record: &Record, records: &[Record]) -> Option<Vec
         step!(encoder.emit_u32(rrsig.sig_expiration().get()));
         step!(encoder.emit_u32(rrsig.sig_inception().get()));
         step!(encoder.emit_u16(rrsig.key_tag()));
-
-        // Signer name in canonical (uncompressed, LOWERCASE) form.
         step!(emit_name_canonical(rrsig.signer_name(), &mut encoder));
 
         for record in &rrset {
@@ -170,7 +169,10 @@ pub fn build_tbs_manual(rrsig_record: &Record, records: &[Record]) -> Option<Vec
             let rdata_len = match u16::try_from(rdata.len()) {
                 Ok(n) => n,
                 Err(_) => {
-                    tracing::debug!(len = rdata.len(), "[manual_tbs] RDATA too long");
+                    tracing::debug!(
+                        len = rdata.len(),
+                        "[manual_tbs] RDATA too long"
+                    );
                     return None;
                 }
             };
@@ -187,55 +189,112 @@ pub fn build_tbs_manual(rrsig_record: &Record, records: &[Record]) -> Option<Vec
 /// Emit a domain name in DNSSEC canonical wire format: uncompressed,
 /// length-prefixed, and lowercased per RFC 4034 §6.2.
 ///
-/// Returns `Ok(())` to integrate with the `step!` macro above.
-/// Errors are surfaced as a synthetic `std::fmt::Error`, which the
-/// macro stringifies and logs.
-fn emit_name_canonical(name: &Name, encoder: &mut BinEncoder) -> Result<(), std::fmt::Error> {
-    let ascii = name.to_ascii();
-    let trimmed = ascii.trim_end_matches('.');
-
-    if !trimmed.is_empty() {
-        for label in trimmed.split('.') {
-            let bytes = label.as_bytes();
-            if bytes.len() > 63 {
-                return Err(std::fmt::Error);
-            }
+/// Uses `Name::iter()` to get the true label bytes. This is critical:
+/// labels can contain escaped dots (e.g. SOA rname `disa\.tinker`)
+/// which must be treated as single labels, not split on the dot.
+fn emit_name_canonical(
+    name: &Name,
+    encoder: &mut BinEncoder,
+) -> Result<(), std::fmt::Error> {
+    for label in name.iter() {
+        if label.is_empty() {
+            // `Name::iter()` yields the root label as an empty slice.
+            // The terminating 0x00 is written once after the loop.
+            continue;
+        }
+        if label.len() > 63 {
+            return Err(std::fmt::Error);
+        }
+        encoder.emit_u8(label.len() as u8).map_err(|_| std::fmt::Error)?;
+        for b in label {
             encoder
-                .emit_u8(bytes.len() as u8)
+                .emit_u8(b.to_ascii_lowercase())
                 .map_err(|_| std::fmt::Error)?;
-            for b in bytes {
-                encoder
-                    .emit_u8(b.to_ascii_lowercase())
-                    .map_err(|_| std::fmt::Error)?;
-            }
         }
     }
     encoder.emit_u8(0).map_err(|_| std::fmt::Error)?;
     Ok(())
 }
 
-/// Encode a record's RDATA. Leaf types (A, AAAA, DNSKEY, DS, NSEC3)
-/// contain no embedded domain names, so a plain emit is canonical.
+/// Canonicalize a record's RDATA per RFC 4034 §6.2.
+///
+/// Types with embedded domain names (SOA, CNAME, NS, MX, DNAME, PTR,
+/// SRV, ...) must have those names lowercased too.
 fn canonical_rdata(record: &Record) -> Option<Vec<u8>> {
     let mut buf: Vec<u8> = Vec::with_capacity(64);
-    {
-        let mut encoder = BinEncoder::new(&mut buf);
-        record.data().emit(&mut encoder).ok()?;
+
+    match record.data() {
+        RData::SOA(soa) => {
+            let mut e = BinEncoder::new(&mut buf);
+            emit_name_canonical(soa.mname(), &mut e).ok()?;
+            emit_name_canonical(soa.rname(), &mut e).ok()?;
+            e.emit_u32(soa.serial()).ok()?;
+            e.emit_u32(soa.refresh() as u32).ok()?;
+            e.emit_u32(soa.retry() as u32).ok()?;
+            e.emit_u32(soa.expire() as u32).ok()?;
+            e.emit_u32(soa.minimum()).ok()?;
+        }
+        RData::CNAME(cname) => {
+            let mut e = BinEncoder::new(&mut buf);
+            emit_name_canonical(&cname.0, &mut e).ok()?;
+        }
+        RData::NS(ns) => {
+            let mut e = BinEncoder::new(&mut buf);
+            emit_name_canonical(&ns.0, &mut e).ok()?;
+        }
+        RData::PTR(ptr) => {
+            let mut e = BinEncoder::new(&mut buf);
+            emit_name_canonical(&ptr.0, &mut e).ok()?;
+        }
+        RData::MX(mx) => {
+            let mut e = BinEncoder::new(&mut buf);
+            e.emit_u16(mx.preference()).ok()?;
+            emit_name_canonical(mx.exchange(), &mut e).ok()?;
+        }
+        RData::SRV(srv) => {
+            let mut e = BinEncoder::new(&mut buf);
+            e.emit_u16(srv.priority()).ok()?;
+            e.emit_u16(srv.weight()).ok()?;
+            e.emit_u16(srv.port()).ok()?;
+            emit_name_canonical(srv.target(), &mut e).ok()?;
+        }
+        _ => {
+            // Types without embedded domain names (A, AAAA, DNSKEY, DS,
+            // NSEC, NSEC3, TXT, ...).
+            let mut e = BinEncoder::new(&mut buf);
+            record.data().emit(&mut e).ok()?;
+        }
     }
+
     Some(buf)
 }
 
+/// Reconstruct the name that was actually signed when the RRSIG is a
+/// wildcard signature. Uses `Name::iter()` for the same reasons as
+/// `emit_name_canonical`.
 fn reconstruct_wildcard_name(owner: &Name, num_labels: u8) -> Option<Name> {
-    let owner_label_count = owner.iter().filter(|l| !l.is_empty()).count();
+    let labels: Vec<&[u8]> = owner.iter().filter(|l| !l.is_empty()).collect();
+    let owner_label_count = labels.len();
+
     if num_labels as usize >= owner_label_count {
         return Some(owner.clone());
     }
 
-    let owner_ascii = owner.to_ascii();
-    let trimmed = owner_ascii.trim_end_matches('.');
-    let parts: Vec<&str> = trimmed.split('.').collect();
-    let skip = parts.len().saturating_sub(num_labels as usize);
-    let tail = parts[skip..].join(".");
-    let wildcard = format!("*.{}.", tail);
-    Name::from_str(&wildcard).ok()
+    let skip = owner_label_count - num_labels as usize;
+    let tail = &labels[skip..];
+
+    // Build "*.<tail>" using from_labels, which preserves labels
+    // with embedded dots exactly (it does not re-parse the ASCII
+    // presentation form).
+    let mut parts: Vec<Vec<u8>> = Vec::with_capacity(tail.len() + 1);
+    parts.push(b"*".to_vec());
+    for label in tail {
+        if label.len() > 63 {
+            return None;
+        }
+        parts.push(label.to_vec());
+    }
+    parts.push(Vec::new()); // root label terminator
+
+    Name::from_labels(parts).ok()
 }

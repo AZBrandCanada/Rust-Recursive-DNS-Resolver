@@ -14,6 +14,11 @@ pub const MAX_NEGATIVE_RECORDS: usize = 8;
 pub const MAX_NSEC3_ITERATIONS: u16 = 150;
 pub const MAX_CLOSEST_ENCLOSER_STEPS: usize = 16;
 
+/// Case-insensitive DNS name comparison (RFC 4343).
+fn name_eq(a: &Name, b: &Name) -> bool {
+    a.to_ascii().eq_ignore_ascii_case(&b.to_ascii())
+}
+
 pub async fn validate_negative(
     recursor: &RecursiveResolver,
     msg: &Message,
@@ -51,9 +56,9 @@ pub async fn validate_negative(
         .unwrap_or_else(|| qname.clone());
 
     if !zone.zone_of(&final_target)
-        && zone != final_target
+        && !name_eq(&zone, &final_target)
         && !zone.zone_of(qname)
-        && zone != *qname
+        && !name_eq(&zone, qname)
     {
         tracing::warn!(
             zone = %zone,
@@ -134,7 +139,7 @@ pub fn verify_negative_rrset(
     let rrsig_records: Vec<Record> = authority
         .iter()
         .filter(|r| {
-            if r.name() != &owner {
+            if !name_eq(r.name(), &owner) {
                 return false;
             }
 
@@ -153,7 +158,7 @@ pub fn verify_negative_rrset(
 
     let full_rrset: Vec<Record> = authority
         .iter()
-        .filter(|r| r.name() == &owner && r.record_type() == rtype)
+        .filter(|r| name_eq(r.name(), &owner) && r.record_type() == rtype)
         .cloned()
         .collect();
 
@@ -163,7 +168,11 @@ pub fn verify_negative_rrset(
 
     for rrsig_record in &rrsig_records {
         let sig = match rrsig_record.data() {
-            RData::DNSSEC(DNSSECRData::RRSIG(sig)) if sig.type_covered() == rtype => sig,
+            RData::DNSSEC(DNSSECRData::RRSIG(sig))
+                if sig.type_covered() == rtype =>
+            {
+                sig
+            }
             _ => continue,
         };
 
@@ -173,7 +182,12 @@ pub fn verify_negative_rrset(
                     return false;
                 }
 
-                if DnssecValidator::verify_rrsig(sig, key, rrsig_record, &full_rrset) {
+                if DnssecValidator::verify_rrsig(
+                    sig,
+                    key,
+                    rrsig_record,
+                    &full_rrset,
+                ) {
                     return true;
                 }
             }
@@ -310,7 +324,7 @@ pub fn validate_nsec3(
         None => return DnssecStatus::Bogus,
     };
 
-    if closest == *qname {
+    if name_eq(&closest, qname) {
         if qtype == RecordType::DS {
             return DnssecStatus::Secure;
         }
@@ -349,7 +363,7 @@ pub fn find_nsec_closest_encloser(qname: &Name, nsec_records: &[&Record]) -> Opt
             return None;
         }
 
-        if nsec_records.iter().any(|r| r.name() == &cur) {
+        if nsec_records.iter().any(|r| name_eq(r.name(), &cur)) {
             return Some(cur);
         }
 
@@ -369,7 +383,7 @@ pub fn check_nsec_nodata(
     nsec_records: &[&Record],
 ) -> Option<DnssecStatus> {
     for &rec in nsec_records {
-        if rec.name() == qname {
+        if name_eq(rec.name(), qname) {
             if let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = rec.data() {
                 let has_type = nsec.type_bit_maps().any(|t| t == qtype);
                 let has_cname = nsec.type_bit_maps().any(|t| t == RecordType::CNAME);
@@ -406,7 +420,9 @@ pub fn check_nsec_wildcard_nodata(
 ) -> Option<DnssecStatus> {
     let wildcard = wildcard_name(closest);
 
-    let wildcard_nsec = nsec_records.iter().find(|&&r| r.name() == &wildcard)?;
+    let wildcard_nsec = nsec_records
+        .iter()
+        .find(|&&r| name_eq(r.name(), &wildcard))?;
 
     if let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = wildcard_nsec.data() {
         let has_type = nsec.type_bit_maps().any(|t| t == qtype);
@@ -601,16 +617,6 @@ pub fn check_nsec3_nxdomain(
         _ => false,
     };
 
-    // RFC 5155 §8.7: when the NSEC3 covering the next-closer has the
-    // Opt-Out flag set, the NXDOMAIN proof is not authenticated for
-    // ANY qtype. The zone owner has explicitly declined to prove the
-    // non-existence of unsigned delegations in the covered span, so
-    // the answer cannot be considered Secure.
-    //
-    //   - For DS queries: the child delegation exists but is unsigned
-    //     (insecure delegation) → return InsecureUnsigned.
-    //   - For all other qtypes: the NXDOMAIN itself is not provably
-    //     correct → return InsecureUnsigned so AD is not set.
     if is_opt_out {
         tracing::debug!(
             qname = %qname,

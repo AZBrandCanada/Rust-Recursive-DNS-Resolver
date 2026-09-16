@@ -327,6 +327,50 @@ pub async fn build_trust_chain(
             }
         };
 
+        // Diagnostic: dump every record in the raw DNSKEY response.
+        tracing::debug!(
+            zone = %zone,
+            rcode = ?dnskey_msg.response_code(),
+            truncated = dnskey_msg.truncated(),
+            answers = dnskey_msg.answers().len(),
+            authority = dnskey_msg.name_servers().len(),
+            additional = dnskey_msg.additionals().len(),
+            "[DNSSEC-DIAG] raw DNSKEY response"
+        );
+        for (i, r) in dnskey_msg.answers().iter().enumerate() {
+            tracing::debug!(
+                zone = %zone,
+                idx = i,
+                owner = %r.name(),
+                rtype = ?r.record_type(),
+                class = ?r.dns_class(),
+                ttl = r.ttl(),
+                "[DNSSEC-DIAG]   answer"
+            );
+        }
+
+        // Diagnostic: dump every record in the raw DNSKEY response.
+        tracing::debug!(
+            zone = %zone,
+            rcode = ?dnskey_msg.response_code(),
+            truncated = dnskey_msg.truncated(),
+            answers = dnskey_msg.answers().len(),
+            authority = dnskey_msg.name_servers().len(),
+            additional = dnskey_msg.additionals().len(),
+            "[DNSSEC-DIAG] raw DNSKEY response"
+        );
+        for (i, r) in dnskey_msg.answers().iter().enumerate() {
+            tracing::debug!(
+                zone = %zone,
+                idx = i,
+                owner = %r.name(),
+                rtype = ?r.record_type(),
+                class = ?r.dns_class(),
+                ttl = r.ttl(),
+                "[DNSSEC-DIAG]   answer"
+            );
+        }
+
         let candidates: Vec<DNSKEY> = dnskey_msg
             .answers()
             .iter()
