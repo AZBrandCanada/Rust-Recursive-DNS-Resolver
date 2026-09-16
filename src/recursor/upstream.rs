@@ -340,12 +340,7 @@ pub async fn query_socket(
     Ok(response)
 }
 
-pub fn response_matches(
-    response: &Message,
-    txid: u16,
-    sent_name: &Name,
-    rtype: RecordType,
-) -> bool {
+pub fn response_matches(response: &Message, txid: u16, sent_name: &Name, rtype: RecordType) -> bool {
     if response.id() != txid || response.message_type() != MessageType::Response {
         return false;
     }
