@@ -3,7 +3,7 @@ use super::chain::{build_trust_chain, ChainResult};
 use super::crypto::{KeyTagExt, ValidationBudget};
 use super::validator::{DnssecStatus, DnssecValidator};
 use crate::recursor::RecursiveResolver;
-use hickory_proto::dnssec::rdata::{DNSSECRData, DNSKEY, RRSIG};
+use hickory_proto::dnssec::rdata::{DNSSECRData, DNSKEY};
 use hickory_proto::dnssec::Nsec3HashAlgorithm;
 use hickory_proto::op::Message;
 use hickory_proto::rr::{Name, RData, Record, RecordType};
@@ -131,10 +131,6 @@ pub fn verify_negative_rrset(
     let owner = rec.name().clone();
     let rtype = rec.record_type();
 
-    // Keep the complete RRSIG Records, not just the RRSIG RDATA.
-    //
-    // The complete Record is required by Hickory's DNSSEC TBS builder because
-    // the canonical signed data depends on the RRSIG owner/name metadata.
     let rrsig_records: Vec<Record> = authority
         .iter()
         .filter(|r| {
@@ -323,8 +319,6 @@ pub fn validate_nsec3(
         None => return DnssecStatus::Bogus,
     };
 
-    // RFC 5155 §8.6: For DS queries, if closest matches qname, the child delegation cut
-    // exists in the parent zone and lacks a DS record (proving insecure delegation).
     if closest == *qname {
         if qtype == RecordType::DS {
             return DnssecStatus::Secure;
@@ -389,12 +383,21 @@ pub fn check_nsec_nodata(
                 let has_type = nsec.type_bit_maps().any(|t| t == qtype);
                 let has_cname = nsec.type_bit_maps().any(|t| t == RecordType::CNAME);
                 let has_soa = nsec.type_bit_maps().any(|t| t == RecordType::SOA);
+                let has_ns = nsec.type_bit_maps().any(|t| t == RecordType::NS);
 
                 if qtype == RecordType::DS && has_soa {
                     return Some(DnssecStatus::Bogus);
                 }
 
                 if !has_type && !has_cname {
+                    if qtype == RecordType::DS && has_ns {
+                        tracing::debug!(
+                            owner = %rec.name(),
+                            "[DNSSEC] NSEC NODATA for DS with NS present; insecure delegation"
+                        );
+                        return Some(DnssecStatus::InsecureUnsigned);
+                    }
+
                     return Some(DnssecStatus::Secure);
                 }
             }
@@ -526,12 +529,21 @@ pub fn check_nsec3_nodata(
                 let has_type = n.type_bit_maps().any(|t| t == qtype);
                 let has_cname = n.type_bit_maps().any(|t| t == RecordType::CNAME);
                 let has_soa = n.type_bit_maps().any(|t| t == RecordType::SOA);
+                let has_ns = n.type_bit_maps().any(|t| t == RecordType::NS);
 
                 if qtype == RecordType::DS && has_soa {
                     return Some(DnssecStatus::Bogus);
                 }
 
                 if !has_type && !has_cname {
+                    if qtype == RecordType::DS && has_ns {
+                        tracing::debug!(
+                            owner = %rec.name(),
+                            "[DNSSEC] NSEC3 NODATA for DS with NS present; insecure delegation"
+                        );
+                        return Some(DnssecStatus::InsecureUnsigned);
+                    }
+
                     return Some(DnssecStatus::Secure);
                 }
             }
@@ -600,11 +612,22 @@ pub fn check_nsec3_nxdomain(
         _ => false,
     };
 
-    if is_opt_out && qtype == RecordType::DS {
+    // RFC 5155 §8.7: when the NSEC3 covering the next-closer has the
+    // Opt-Out flag set, the NXDOMAIN proof is not authenticated for
+    // ANY qtype. The zone owner has explicitly declined to prove the
+    // non-existence of unsigned delegations in the covered span, so
+    // the answer cannot be considered Secure.
+    //
+    //   - For DS queries: the child delegation exists but is unsigned
+    //     (insecure delegation) → return InsecureUnsigned.
+    //   - For all other qtypes: the NXDOMAIN itself is not provably
+    //     correct → return InsecureUnsigned so AD is not set.
+    if is_opt_out {
         tracing::debug!(
             qname = %qname,
             qtype = ?qtype,
-            "[DNSSEC] Opt-Out NSEC3 covers next-closer for DS query; proves insecure delegation"
+            covering_owner = %covering_rec.name(),
+            "[DNSSEC] Opt-Out NSEC3 covers next-closer; treating as Insecure"
         );
 
         return Some(DnssecStatus::InsecureUnsigned);

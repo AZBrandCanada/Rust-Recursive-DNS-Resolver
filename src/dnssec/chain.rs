@@ -174,12 +174,16 @@ pub async fn build_trust_chain(
                 };
 
                 match denial_status {
-                    DnssecStatus::Secure | DnssecStatus::InsecureUnsigned => {
+                    DnssecStatus::InsecureUnsigned => {
+                        // Authenticated proof of no DS at a name with
+                        // an NS record in the parent → real insecure
+                        // delegation. Everything below this point is
+                        // unauthenticated.
                         let ds_proof_ttl = calculate_min_ttl(&ds_msg);
 
                         tracing::debug!(
                             zone = %zone,
-                            "[DNSSEC] Authenticated denial of DS verified: zone is Insecure"
+                            "[DNSSEC] Authenticated insecure delegation; zone is Insecure"
                         );
 
                         signed_zone_cache().insert(
@@ -193,6 +197,21 @@ pub async fn build_trust_chain(
                         return ChainResult::Unsigned {
                             ttl: ds_proof_ttl,
                         };
+                    }
+
+                    DnssecStatus::Secure => {
+                        // Authenticated proof of no DS at a name with
+                        // NO NS record in the parent → empty
+                        // non-terminal (ENT) or non-existent name.
+                        // It is NOT a delegation, so we skip it and
+                        // keep walking with the current parent's
+                        // trusted keys.
+                        tracing::debug!(
+                            zone = %zone,
+                            "[DNSSEC] No delegation at this name (empty non-terminal); \
+                             continuing chain walk with parent keys"
+                        );
+                        continue;
                     }
 
                     _ => {

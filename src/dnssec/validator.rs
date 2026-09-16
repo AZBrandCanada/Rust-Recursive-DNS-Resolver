@@ -88,18 +88,94 @@ impl DnssecValidator {
             ResponseCode::NoError => {
                 let answers: Vec<Record> = msg.answers().to_vec();
 
-                Self::validate_answer(
+                let status = Self::validate_answer(
                     recursor,
                     qname,
                     qtype,
                     &answers,
                     budget,
                 )
-                .await
+                .await;
+
+                // RFC 5155 §8.8: a wildcard-expanded answer in an
+                // NSEC3 zone is only provably Secure if the response
+                // includes NSEC3 records that (a) prove the closest
+                // encloser and (b) cover the next-closer name with a
+                // non-opt-out NSEC3. If any covering NSEC3 in the
+                // authority section has the Opt-Out flag set, the
+                // wildcard match might be shadowed by an unsigned
+                // delegation and the answer must not be marked AD.
+                if status == DnssecStatus::Secure {
+                    if let Some(downgrade) = Self::wildcard_optout_check(msg, &answers) {
+                        return downgrade;
+                    }
+                }
+
+                status
             }
 
             _ => DnssecStatus::InsecureUnknown,
         }
+    }
+
+    /// Detect wildcard-expanded answers in NSEC3 opt-out zones and
+    /// downgrade them from Secure to InsecureUnknown.
+    fn wildcard_optout_check(
+        msg: &Message,
+        answers: &[Record],
+    ) -> Option<DnssecStatus> {
+        // Is any answer RRSIG a wildcard RRSIG?
+        let has_wildcard_rrsig = answers.iter().any(|r| {
+            if let RData::DNSSEC(DNSSECRData::RRSIG(sig)) = r.data() {
+                let owner_labels =
+                    r.name().iter().filter(|l| !l.is_empty()).count() as u8;
+                sig.num_labels() < owner_labels
+            } else {
+                false
+            }
+        });
+
+        if !has_wildcard_rrsig {
+            return None;
+        }
+
+        // Only applies when the authority section carries NSEC3
+        // records (i.e. we're in an NSEC3-signed zone).
+        let nsec3_in_authority = msg
+            .name_servers()
+            .iter()
+            .any(|r| r.record_type() == RecordType::NSEC3);
+
+        if !nsec3_in_authority {
+            return None;
+        }
+
+        // If any NSEC3 in the authority section has the Opt-Out flag
+        // set, the wildcard answer is not provably secure.
+        let has_optout = msg.name_servers().iter().any(|r| {
+            if let RData::DNSSEC(DNSSECRData::NSEC3(n)) = r.data() {
+                (n.flags() & 0x01) != 0
+            } else {
+                false
+            }
+        });
+
+        if has_optout {
+            tracing::debug!(
+                "[DNSSEC] Wildcard answer in NSEC3 opt-out zone; \
+                 downgrading Secure to InsecureUnknown"
+            );
+            return Some(DnssecStatus::InsecureUnknown);
+        }
+
+        // Without full RFC 5155 §8.8 wildcard proof validation we
+        // cannot confidently mark this Secure, so be conservative.
+        tracing::debug!(
+            "[DNSSEC] Wildcard answer in NSEC3 zone; wildcard proof \
+             validation not implemented, downgrading Secure to \
+             InsecureUnknown"
+        );
+        Some(DnssecStatus::InsecureUnknown)
     }
 
     pub async fn validate_answer(
@@ -287,12 +363,6 @@ impl DnssecValidator {
         all_records: &[Record],
         budget: &mut ValidationBudget,
     ) -> DnssecStatus {
-        /*
-         * Keep the complete RRSIG Records here.
-         *
-         * We need the complete Record later because Hickory's DNSSEC TBS
-         * builder requires the RRSIG record metadata as well as the RRSIG RDATA.
-         */
         let rrsig_records: Vec<Record> = all_records
             .iter()
             .filter(|record| match record.data() {
@@ -341,9 +411,6 @@ impl DnssecValidator {
 
         let now = now_secs();
 
-        /*
-         * Store complete RRSIG Records rather than just RRSIG RDATA.
-         */
         let mut candidates: Vec<Record> = Vec::new();
 
         for rrsig_record in &rrsig_records {
@@ -365,10 +432,6 @@ impl DnssecValidator {
                 continue;
             }
 
-            /*
-             * RFC 4035 requires the RRSIG signer name to identify the
-             * zone containing the covered RRset.
-             */
             let zone = rrsig.signer_name();
 
             if !zone.zone_of(owner) && zone != owner {
@@ -381,10 +444,6 @@ impl DnssecValidator {
                 continue;
             }
 
-            /*
-             * The RRSIG Labels field cannot exceed the number of labels
-             * in the covered owner name.
-             */
             if rrsig.num_labels() > owner.num_labels() {
                 tracing::warn!(
                     owner = %owner,
@@ -428,11 +487,6 @@ impl DnssecValidator {
                 } => {
                     any_trusted_chain = true;
 
-                    /*
-                     * Match the RRSIG key tag BEFORE consuming a crypto
-                     * validation budget slot. This prevents unrelated
-                     * DNSKEYs from exhausting the KeyTrap protection budget.
-                     */
                     for dnskey in &trusted_keys {
                         let key_tag =
                             compute_key_tag(dnskey).unwrap_or(u16::MAX);
@@ -448,26 +502,6 @@ impl DnssecValidator {
                             );
 
                             return DnssecStatus::Bogus;
-                        }
-
-                        // Log the algorithm and key size once per
-                        // candidate so that any future regression in
-                        // legacy RSA/SHA-1 handling is easy to diagnose.
-                        let rrsig_alg = u8::from(rrsig.algorithm());
-                        let dnskey_alg =
-                            u8::from(dnskey.public_key().algorithm());
-
-                        if rrsig_alg == 5 || rrsig_alg == 7 {
-                            let pk_len =
-                                dnskey.public_key().public_bytes().len();
-                            tracing::debug!(
-                                owner = %owner,
-                                rrsig_alg,
-                                dnskey_alg,
-                                key_tag,
-                                dnskey_pubkey_bytes = pk_len,
-                                "[DNSSEC] Attempting legacy RSA/SHA-1 verification"
-                            );
                         }
 
                         if Self::verify_rrsig(
@@ -558,9 +592,6 @@ impl DnssecValidator {
             }
         };
 
-        // Primary path: our own verify_signature(), which uses ring
-        // first and falls back to the pure-Rust rsa crate for
-        // algorithm 5 / 7 keys below ring's 2048-bit floor.
         if verify_signature(
             rrsig.algorithm(),
             dnskey.public_key().public_bytes(),
@@ -570,9 +601,6 @@ impl DnssecValidator {
             return true;
         }
 
-        // Secondary path: Hickory's own verify(). Kept for the
-        // algorithms Hickory does support, and as a safety net in case
-        // our dispatch misses a variant.
         if dnskey.public_key().verify(&tbs, rrsig.sig()).is_ok() {
             return true;
         }
