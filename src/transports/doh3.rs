@@ -32,10 +32,7 @@ pub async fn run_doh3_listener(
                 }
             };
 
-            let h3_conn = match h3::server::builder()
-                .build(h3_quinn::Connection::new(conn.clone()))
-                .await
-            {
+            let h3_conn = match h3::server::builder().build(h3_quinn::Connection::new(conn.clone())).await {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::debug!(error = %e, "[DoH3] Failed to establish HTTP/3 session");
@@ -111,24 +108,14 @@ async fn handle_h3_request(
             });
 
             let Some(encoded) = dns_param else {
-                send_error_response(
-                    &mut stream,
-                    StatusCode::BAD_REQUEST,
-                    "Missing dns query parameter",
-                )
-                .await;
+                send_error_response(&mut stream, StatusCode::BAD_REQUEST, "Missing dns query parameter").await;
                 return;
             };
 
             match decode_dns_param(encoded) {
                 Ok(bytes) if !bytes.is_empty() => bytes,
                 _ => {
-                    send_error_response(
-                        &mut stream,
-                        StatusCode::BAD_REQUEST,
-                        "Invalid base64url payload",
-                    )
-                    .await;
+                    send_error_response(&mut stream, StatusCode::BAD_REQUEST, "Invalid base64url payload").await;
                     return;
                 }
             }
@@ -142,12 +129,7 @@ async fn handle_h3_request(
                 .unwrap_or(false);
 
             if !is_dns_message {
-                send_error_response(
-                    &mut stream,
-                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                    "Invalid content-type",
-                )
-                .await;
+                send_error_response(&mut stream, StatusCode::UNSUPPORTED_MEDIA_TYPE, "Invalid content-type").await;
                 return;
             }
 
@@ -160,30 +142,19 @@ async fn handle_h3_request(
                     chunk.advance(len);
                 }
                 if body.len() > MAX_DOH_PAYLOAD {
-                    send_error_response(
-                        &mut stream,
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        "Query payload too large",
-                    )
-                    .await;
+                    send_error_response(&mut stream, StatusCode::PAYLOAD_TOO_LARGE, "Query payload too large").await;
                     return;
                 }
             }
 
             if body.is_empty() {
-                send_error_response(&mut stream, StatusCode::BAD_REQUEST, "Empty request body")
-                    .await;
+                send_error_response(&mut stream, StatusCode::BAD_REQUEST, "Empty request body").await;
                 return;
             }
             body
         }
         _ => {
-            send_error_response(
-                &mut stream,
-                StatusCode::METHOD_NOT_ALLOWED,
-                "Method not allowed",
-            )
-            .await;
+            send_error_response(&mut stream, StatusCode::METHOD_NOT_ALLOWED, "Method not allowed").await;
             return;
         }
     };
@@ -195,10 +166,7 @@ async fn handle_h3_request(
         | ProcessOutcome::ServFail(wire)
         | ProcessOutcome::Truncated(wire) => (StatusCode::OK, wire),
         ProcessOutcome::Malformed => (StatusCode::BAD_REQUEST, b"Malformed DNS message".to_vec()),
-        ProcessOutcome::Dropped => (
-            StatusCode::TOO_MANY_REQUESTS,
-            b"Rate limit exceeded".to_vec(),
-        ),
+        ProcessOutcome::Dropped => (StatusCode::TOO_MANY_REQUESTS, b"Rate limit exceeded".to_vec()),
     };
 
     if let Ok(resp) = Response::builder()

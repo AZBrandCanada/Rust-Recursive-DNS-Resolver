@@ -1,20 +1,8 @@
 // src/dnssec/crypto.rs
-//
-// DNSSEC signature verification primitives.
-//
-// `verify_signature` intentionally matches on the deprecated algorithm
-// variants RSASHA1 (5) and RSASHA1NSEC3SHA1 (7) because a nontrivial
-// fraction of the deployed DNSSEC tree still uses them, most notably
-// the CentralNic-operated legacy `.com`-style zones (uk.com, eu.com,
-// us.com, co.com, de.com, uk.net) and several university and
-// government zones (cmu.edu, *.go.jp). Refusing to verify these would
-// break those zones. The `#[allow(deprecated)]` attribute below is the
-// single controlled place where the deprecated identifiers are used;
-// nothing else in the codebase reaches for them.
 
-use hickory_proto::dnssec::rdata::{DNSKEY, RRSIG};
+use hickory_proto::dnssec::rdata::{DNSKEY, DNSSECRData, RRSIG};
 use hickory_proto::dnssec::Algorithm;
-use hickory_proto::rr::{Name, Record};
+use hickory_proto::rr::{Name, RData, Record};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 
 use ml_dsa::signature::Verifier;
@@ -123,7 +111,11 @@ pub fn compute_key_tag(dnskey: &DNSKEY) -> Option<u16> {
 ///   1 = SHA-1
 ///   2 = SHA-256
 ///   4 = SHA-384
-pub fn compute_ds_digest(owner: &Name, dnskey: &DNSKEY, digest_type: u8) -> Option<Vec<u8>> {
+pub fn compute_ds_digest(
+    owner: &Name,
+    dnskey: &DNSKEY,
+    digest_type: u8,
+) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
 
     {
@@ -153,7 +145,10 @@ pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
 
     (0..s.len())
         .step_by(2)
-        .map(|i| s.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok()))
+        .map(|i| {
+            s.get(i..i + 2)
+                .and_then(|b| u8::from_str_radix(b, 16).ok())
+        })
         .collect()
 }
 
@@ -164,16 +159,14 @@ pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
 /// truncated TBS (~26 bytes for uk.com instead of ~48). This function
 /// delegates to crate::dnssec::manual_tbs which implements
 /// RFC 4034 §3.1.8.1 directly.
-pub fn build_tbs(rrsig_record: &Record, records: &[Record]) -> Option<Vec<u8>> {
+pub fn build_tbs(
+    rrsig_record: &Record,
+    records: &[Record],
+) -> Option<Vec<u8>> {
     crate::dnssec::manual_tbs::build_tbs_manual(rrsig_record, records)
 }
 
 /// Verify a DNSSEC signature using the supplied DNSKEY algorithm.
-///
-/// The deprecation allows below apply only to the algorithm-5 and
-/// algorithm-7 match arm, which are required for interoperability with
-/// the still-deployed legacy RSA/SHA-1 DNSSEC tree.
-#[allow(deprecated)]
 pub fn verify_signature(
     algorithm: Algorithm,
     pubkey_bytes: &[u8],
@@ -245,12 +238,12 @@ pub fn verify_signature(
                 return false;
             };
 
-            let verify_alg: &'static signature::RsaParameters = if algorithm == Algorithm::RSASHA256
-            {
-                &signature::RSA_PKCS1_2048_8192_SHA256
-            } else {
-                &signature::RSA_PKCS1_2048_8192_SHA512
-            };
+            let verify_alg: &'static signature::RsaParameters =
+                if algorithm == Algorithm::RSASHA256 {
+                    &signature::RSA_PKCS1_2048_8192_SHA256
+                } else {
+                    &signature::RSA_PKCS1_2048_8192_SHA512
+                };
 
             let components = signature::RsaPublicKeyComponents {
                 n: modulus,
@@ -261,7 +254,9 @@ pub fn verify_signature(
                 return true;
             }
 
-            if modulus.len() < RING_RSA_MIN_MODULUS_BYTES && algorithm == Algorithm::RSASHA256 {
+            if modulus.len() < RING_RSA_MIN_MODULUS_BYTES
+                && algorithm == Algorithm::RSASHA256
+            {
                 return verify_rsa_sha256_via_rsa_crate(exponent, modulus, message, sig);
             }
 
@@ -273,8 +268,10 @@ pub fn verify_signature(
             full_key.push(0x04);
             full_key.extend_from_slice(pubkey_bytes);
 
-            let key =
-                signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_FIXED, &full_key);
+            let key = signature::UnparsedPublicKey::new(
+                &signature::ECDSA_P256_SHA256_FIXED,
+                &full_key,
+            );
 
             key.verify(message, sig).is_ok()
         }
@@ -284,14 +281,19 @@ pub fn verify_signature(
             full_key.push(0x04);
             full_key.extend_from_slice(pubkey_bytes);
 
-            let key =
-                signature::UnparsedPublicKey::new(&signature::ECDSA_P384_SHA384_FIXED, &full_key);
+            let key = signature::UnparsedPublicKey::new(
+                &signature::ECDSA_P384_SHA384_FIXED,
+                &full_key,
+            );
 
             key.verify(message, sig).is_ok()
         }
 
         Algorithm::ED25519 => {
-            let key = signature::UnparsedPublicKey::new(&signature::ED25519, pubkey_bytes);
+            let key = signature::UnparsedPublicKey::new(
+                &signature::ED25519,
+                pubkey_bytes,
+            );
 
             key.verify(message, sig).is_ok()
         }
@@ -387,7 +389,11 @@ fn verify_rsa_sha256_via_rsa_crate(
 }
 
 /// Verify an ML-DSA-44 DNSSEC signature.
-pub fn verify_mldsa44(pubkey_bytes: &[u8], message: &[u8], sig: &[u8]) -> bool {
+pub fn verify_mldsa44(
+    pubkey_bytes: &[u8],
+    message: &[u8],
+    sig: &[u8],
+) -> bool {
     let Ok(vk_enc) = EncodedVerifyingKey::<MlDsa44>::try_from(pubkey_bytes) else {
         tracing::debug!(
             len = pubkey_bytes.len(),

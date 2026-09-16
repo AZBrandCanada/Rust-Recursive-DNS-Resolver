@@ -36,43 +36,48 @@ pub async fn run_doq_listener(
 
 async fn handle_doq_connection(conn: quinn::Connection, state: AppState) {
     let peer_ip = conn.remote_address().ip();
-    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
-        let state_ref = state.clone();
-        tokio::spawn(async move {
-            let mut len_buf = [0u8; 2];
-            if recv.read_exact(&mut len_buf).await.is_err() {
-                return;
-            }
-            let req_len = u16::from_be_bytes(len_buf) as usize;
-            if !(MIN_DNS_MSG_SIZE..=MAX_TCP_MSG_SIZE).contains(&req_len) {
-                let _ = send.reset(quinn::VarInt::from_u32(DOQ_PROTOCOL_ERROR));
-                return;
-            }
-
-            let mut req_buf = vec![0u8; req_len];
-            if recv.read_exact(&mut req_buf).await.is_err() {
-                return;
-            }
-
-            let outcome = process_dns_query(&req_buf, &state_ref, "DoQ", peer_ip).await;
-            match outcome {
-                ProcessOutcome::Success(resp_wire)
-                | ProcessOutcome::ServFail(resp_wire)
-                | ProcessOutcome::Truncated(resp_wire) => {
-                    let len_bytes = (resp_wire.len() as u16).to_be_bytes();
-                    if send.write_all(&len_bytes).await.is_ok()
-                        && send.write_all(&resp_wire).await.is_ok()
-                    {
-                        let _ = send.finish();
+    loop {
+        match conn.accept_bi().await {
+            Ok((mut send, mut recv)) => {
+                let state_ref = state.clone();
+                tokio::spawn(async move {
+                    let mut len_buf = [0u8; 2];
+                    if recv.read_exact(&mut len_buf).await.is_err() {
+                        return;
                     }
-                }
-                ProcessOutcome::Dropped => {
-                    let _ = send.reset(quinn::VarInt::from_u32(DOQ_EXCESSIVE_LOAD));
-                }
-                ProcessOutcome::Malformed => {
-                    let _ = send.reset(quinn::VarInt::from_u32(DOQ_PROTOCOL_ERROR));
-                }
+                    let req_len = u16::from_be_bytes(len_buf) as usize;
+                    if req_len < MIN_DNS_MSG_SIZE || req_len > MAX_TCP_MSG_SIZE {
+                        let _ = send.reset(quinn::VarInt::from_u32(DOQ_PROTOCOL_ERROR));
+                        return;
+                    }
+
+                    let mut req_buf = vec![0u8; req_len];
+                    if recv.read_exact(&mut req_buf).await.is_err() {
+                        return;
+                    }
+
+                    let outcome = process_dns_query(&req_buf, &state_ref, "DoQ", peer_ip).await;
+                    match outcome {
+                        ProcessOutcome::Success(resp_wire)
+                        | ProcessOutcome::ServFail(resp_wire)
+                        | ProcessOutcome::Truncated(resp_wire) => {
+                            let len_bytes = (resp_wire.len() as u16).to_be_bytes();
+                            if send.write_all(&len_bytes).await.is_ok()
+                                && send.write_all(&resp_wire).await.is_ok()
+                            {
+                                let _ = send.finish();
+                            }
+                        }
+                        ProcessOutcome::Dropped => {
+                            let _ = send.reset(quinn::VarInt::from_u32(DOQ_EXCESSIVE_LOAD));
+                        }
+                        ProcessOutcome::Malformed => {
+                            let _ = send.reset(quinn::VarInt::from_u32(DOQ_PROTOCOL_ERROR));
+                        }
+                    }
+                });
             }
-        });
+            Err(_) => break,
+        }
     }
 }
