@@ -16,4 +16,9 @@ cd dns_diff_tester
 export TARGET_DOH="https://example.com/dns-query"
 export WANT_DNSSEC=1
 
+WANT_DNSSEC=1 CONCURRENCY=10 TARGET_DOH="https://your-dns-endpoint/dns-query" ./run.sh
+
+
 ./run.sh
+
+

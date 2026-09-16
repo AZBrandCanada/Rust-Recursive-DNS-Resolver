@@ -1,12 +1,14 @@
-# dns_diff_tester/test_doh.py
+import concurrent.futures
 import csv
 import io
 import json
 import os
 import signal
 import sys
+import threading
 import time
 import zipfile
+
 import dns.flags
 import dns.message
 import dns.rcode
@@ -29,17 +31,29 @@ DIFF_LOG_JSONL = "diff_log.jsonl"
 DIFF_LOG_TXT = "diff_log.txt"
 
 QUERY_TIMEOUT = float(os.getenv("TIMEOUT", "5.0"))
-DELAY_BETWEEN_DOMAINS = float(os.getenv("DELAY", "0.02"))
-WANT_DNSSEC = os.getenv("WANT_DNSSEC", "0") == "1"
+DELAY_BETWEEN_DOMAINS = float(os.getenv("DELAY", "0"))
+WANT_DNSSEC = os.getenv("WANT_DNSSEC", "0").strip().lower() in ("1", "true", "yes", "on")
+CONCURRENCY = int(os.getenv("CONCURRENCY", "10"))
 
 stop_requested = False
 
 def sigint_handler(sig, frame):
     global stop_requested
-    print("\n[INFO] Graceful shutdown requested. Finishing current domain...")
+    print("\n[INFO] Graceful shutdown requested. Finishing current domains...")
     stop_requested = True
 
 signal.signal(signal.SIGINT, sigint_handler)
+
+_thread_local = threading.local()
+
+def get_session():
+    if not hasattr(_thread_local, "session"):
+        s = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        _thread_local.session = s
+    return _thread_local.session
 
 def ensure_tranco_list():
     if os.path.exists(TRANCO_CSV):
@@ -146,6 +160,29 @@ def records_strictly_equal(resp1, resp2):
 def dnssec_ad_equal(resp1, resp2):
     return resp1.get("ad_bit") == resp2.get("ad_bit")
 
+def evaluate_domain(current_index, rank, domain):
+    try:
+        ascii_domain = domain.encode("idna").decode("ascii")
+        query_msg = dns.message.make_query(
+            ascii_domain,
+            dns.rdatatype.A,
+            want_dnssec=WANT_DNSSEC,
+        )
+        wire_data = query_msg.to_wire()
+    except Exception:
+        return current_index, rank, domain, None
+
+    session = get_session()
+    t_msg, t_err, t_lat = query_doh(session, TARGET_URL, wire_data)
+    g_msg, g_err, g_lat = query_doh(session, GOOGLE_URL, wire_data)
+    c_msg, c_err, c_lat = query_doh(session, CLOUDFLARE_URL, wire_data)
+
+    t_norm = normalize_response(t_msg, t_err, t_lat)
+    g_norm = normalize_response(g_msg, g_err, g_lat)
+    c_norm = normalize_response(c_msg, c_err, c_lat)
+
+    return current_index, rank, domain, (t_norm, g_norm, c_norm, t_lat, g_lat, c_lat)
+
 def main():
     ensure_tranco_list()
     start_index = load_checkpoint()
@@ -154,12 +191,8 @@ def main():
     print(f"[CONFIG] Google DoH:       {GOOGLE_URL}")
     print(f"[CONFIG] Cloudflare DoH:   {CLOUDFLARE_URL}")
     print(f"[CONFIG] DNSSEC Active:    {WANT_DNSSEC} (DO=1 query flag & AD bit verification)")
+    print(f"[CONFIG] Concurrency:      {CONCURRENCY}")
     print(f"[CONFIG] Resuming at:      Domain index #{start_index + 1}")
-
-    session = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
 
     total_tested = 0
     passed = 0
@@ -177,39 +210,21 @@ def main():
 
         reader = csv.reader(f_in)
 
-        for current_index, row in enumerate(reader):
-            if current_index < start_index:
-                continue
+        futures = set()
+        active_indices = set()
+        last_submitted_index = start_index - 1
 
-            if stop_requested:
-                save_checkpoint(current_index)
-                print(f"[INFO] Saved checkpoint at domain index #{current_index}. Safe to exit.")
-                sys.exit(0)
+        def handle_result(result):
+            nonlocal total_tested, passed, dnssec_validated, dnssec_diffs
+            nonlocal consensus_diffs, split_diffs, target_errors, reference_failures, all_three_errors
 
-            if not row or len(row) < 2:
-                continue
+            current_index, rank, domain, eval_data = result
+            active_indices.discard(current_index)
 
-            rank, domain = row[0].strip(), row[1].strip()
+            if eval_data is None:
+                return
 
-            try:
-                ascii_domain = domain.encode("idna").decode("ascii")
-                query_msg = dns.message.make_query(
-                    ascii_domain,
-                    dns.rdatatype.A,
-                    want_dnssec=WANT_DNSSEC,
-                )
-                wire_data = query_msg.to_wire()
-            except Exception:
-                continue
-
-            t_msg, t_err, t_lat = query_doh(session, TARGET_URL, wire_data)
-            g_msg, g_err, g_lat = query_doh(session, GOOGLE_URL, wire_data)
-            c_msg, c_err, c_lat = query_doh(session, CLOUDFLARE_URL, wire_data)
-
-            t_norm = normalize_response(t_msg, t_err, t_lat)
-            g_norm = normalize_response(g_msg, g_err, g_lat)
-            c_norm = normalize_response(c_msg, c_err, c_lat)
-
+            t_norm, g_norm, c_norm, t_lat, g_lat, c_lat = eval_data
             total_tested += 1
 
             log_discrepancy = False
@@ -355,7 +370,8 @@ def main():
                 print(f"[{tag}] #{current_index + 1} {domain}: {category} (Target: {t_lat}ms)")
 
             if total_tested % 100 == 0:
-                save_checkpoint(current_index + 1)
+                safe_checkpoint = min(active_indices) if active_indices else last_submitted_index + 1
+                save_checkpoint(safe_checkpoint)
                 dnssec_stat = f"DNSSEC Validated: {dnssec_validated} | DNSSEC Diff: {dnssec_diffs} | " if WANT_DNSSEC else ""
                 print(
                     f"[PROGRESS] Checked: {total_tested} | "
@@ -366,10 +382,46 @@ def main():
                     f"Target Errs: {target_errors}"
                 )
 
-            if DELAY_BETWEEN_DOMAINS > 0:
-                time.sleep(DELAY_BETWEEN_DOMAINS)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
+            for current_index, row in enumerate(reader):
+                if current_index < start_index:
+                    continue
 
-        save_checkpoint(current_index + 1)
+                if stop_requested:
+                    break
+
+                if not row or len(row) < 2:
+                    continue
+
+                rank, domain = row[0].strip(), row[1].strip()
+
+                fut = executor.submit(evaluate_domain, current_index, rank, domain)
+                futures.add(fut)
+                active_indices.add(current_index)
+                last_submitted_index = current_index
+
+                if DELAY_BETWEEN_DOMAINS > 0:
+                    time.sleep(DELAY_BETWEEN_DOMAINS)
+
+                while len(futures) >= CONCURRENCY * 2:
+                    done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+                    for f in done:
+                        futures.remove(f)
+                        handle_result(f.result())
+
+            while futures:
+                done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+                for f in done:
+                    futures.remove(f)
+                    handle_result(f.result())
+
+        safe_checkpoint = min(active_indices) if active_indices else last_submitted_index + 1
+        save_checkpoint(safe_checkpoint)
+
+        if stop_requested:
+            print(f"[INFO] Saved checkpoint at domain index #{safe_checkpoint}. Safe to exit.")
+            sys.exit(0)
+
         print(f"\n[DONE] Finished testing {total_tested} domains.")
         print(
             f"Passed: {passed} | "
