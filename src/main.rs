@@ -190,7 +190,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // DoQ (UDP 853 - RFC 9250)
     let doq_server_config = create_quic_server_config(&loaded_cert, vec![b"doq".to_vec()])?;
-    let (doq_endpoint, active_doq_port) = bind_quic_endpoint(&host, requested_doq_port, 8853, doq_server_config)?;
+    let (doq_endpoint, active_doq_port) =
+        bind_quic_endpoint(&host, requested_doq_port, 8853, doq_server_config)?;
     let doq_state = app_state.clone();
     let doq_sem = doq_semaphore.clone();
     tokio::spawn(async move {
@@ -199,7 +200,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // DoH3 (UDP 443 - RFC 9114 / RFC 8484)
     let doh3_server_config = create_quic_server_config(&loaded_cert, vec![b"h3".to_vec()])?;
-    let (doh3_endpoint, active_doh3_port) = bind_quic_endpoint(&host, requested_doh3_port, 8443, doh3_server_config)?;
+    let (doh3_endpoint, active_doh3_port) =
+        bind_quic_endpoint(&host, requested_doh3_port, 8443, doh3_server_config)?;
     let doh3_state = app_state.clone();
     let doh3_sem = doh3_semaphore.clone();
     tokio::spawn(async move {
