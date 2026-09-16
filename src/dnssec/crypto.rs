@@ -1,7 +1,7 @@
 // src/dnssec/crypto.rs
 
 use hickory_proto::dnssec::rdata::{DNSKEY, DNSSECRData, RRSIG};
-use hickory_proto::dnssec::{Algorithm, TBS};
+use hickory_proto::dnssec::Algorithm;
 use hickory_proto::rr::{Name, RData, Record};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 
@@ -14,11 +14,11 @@ use ml_dsa::{
 use ring::digest;
 use ring::signature;
 
-use rsa::pkcs1v15::{Signature as RsaPkcs1v15Signature, VerifyingKey as RsaVerifyingKey};
-use rsa::signature::Verifier as RsaVerifierTrait;
+use rsa::pkcs1v15::{Signature as RsaSig, VerifyingKey as RsaVK};
+use rsa::signature::Verifier as _;
 use rsa::{BigUint, RsaPublicKey};
-use sha1::Sha1;
 
+use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384};
 
 pub const PER_VALIDATION_MAX_SIG_CHECKS: usize = 24;
@@ -128,18 +128,12 @@ pub fn compute_ds_digest(
 
     match digest_type {
         1 => Some(
-            digest::digest(
-                &digest::SHA1_FOR_LEGACY_USE_ONLY,
-                &buf,
-            )
-            .as_ref()
-            .to_vec(),
+            digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, &buf)
+                .as_ref()
+                .to_vec(),
         ),
-
         2 => Some(Sha256::digest(&buf).to_vec()),
-
         4 => Some(Sha384::digest(&buf).to_vec()),
-
         _ => None,
     }
 }
@@ -160,104 +154,16 @@ pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
 
 /// Build the DNSSEC "to be signed" data for an RRSIG.
 ///
-/// Hickory already implements the RFC 4034/4035 canonical DNSSEC
-/// serialization. Using TBS::from_rrsig avoids maintaining our own
-/// implementation of:
-///
-///   RRSIG RDATA (without Signature)
-///   + canonical RRset
-///   + original TTL
-///   + canonical names
-///   + wildcard owner reconstruction
-///   + canonical RR ordering
-///   + uncompressed DNS names
-///
-/// The resolver stores packets as generic Record<RData>, while Hickory's
-/// TBS::from_rrsig() requires a typed Record<RRSIG>. Therefore the RRSIG
-/// record is converted to Record<RRSIG> before passing it to Hickory.
+/// hickory-proto 0.25.2's TBS::from_rrsig() emits only the RRSIG
+/// RDATA prefix and silently drops the RRset records, producing a
+/// truncated TBS (~26 bytes for uk.com instead of ~48). This function
+/// delegates to crate::dnssec::manual_tbs which implements
+/// RFC 4034 §3.1.8.1 directly.
 pub fn build_tbs(
     rrsig_record: &Record,
     records: &[Record],
 ) -> Option<Vec<u8>> {
-    let rrsig = match rrsig_record.data() {
-        RData::DNSSEC(DNSSECRData::RRSIG(sig)) => sig,
-        _ => return None,
-    };
-
-    if records.is_empty() {
-        return None;
-    }
-
-    let owner = rrsig_record.name();
-
-    /*
-     * RFC 4034:
-     *
-     * The Labels field cannot exceed the number of labels in the
-     * original owner name.
-     */
-    if rrsig.num_labels() > owner.num_labels() {
-        tracing::debug!(
-            owner = %owner,
-            rrsig_labels = rrsig.num_labels(),
-            owner_labels = owner.num_labels(),
-            "[DNSSEC] RRSIG Labels exceeds owner label count"
-        );
-
-        return None;
-    }
-
-    let expected_type = rrsig.type_covered();
-    let expected_class = records[0].dns_class();
-
-    /*
-     * Make sure the supplied RRset actually corresponds to the
-     * RRSIG being verified.
-     */
-    for record in records {
-        if record.record_type() != expected_type
-            || record.dns_class() != expected_class
-            || record.name() != owner
-        {
-            tracing::debug!(
-                owner = %owner,
-                expected_type = ?expected_type,
-                actual_type = ?record.record_type(),
-                "[DNSSEC] Record set does not match RRSIG"
-            );
-
-            return None;
-        }
-    }
-
-    /*
-     * Convert the generic Record<RData> containing the RRSIG into
-     * Hickory's typed Record<RRSIG>.
-     *
-     * Record::from_rdata() creates the typed record, and we preserve
-     * the original DNS class because the generic record may not be IN.
-     */
-    let mut typed_rrsig =
-        Record::from_rdata(
-            rrsig_record.name().clone(),
-            rrsig_record.ttl(),
-            rrsig.clone(),
-        );
-
-    typed_rrsig.set_dns_class(rrsig_record.dns_class());
-
-    /*
-     * Hickory 0.25.2 performs the complete DNSSEC canonical TBS
-     * construction here. This is algorithm-independent and correct
-     * for algorithm 5 and algorithm 7 alike.
-     */
-    let tbs = TBS::from_rrsig(
-        &typed_rrsig,
-        records.iter(),
-    )
-    .ok()?;
-
-    Some(tbs.as_ref().to_vec())
+    crate::dnssec::manual_tbs::build_tbs_manual(rrsig_record, records)
 }
 
 /// Verify a DNSSEC signature using the supplied DNSKEY algorithm.
@@ -277,14 +183,11 @@ pub fn verify_signature(
          * over the exact same TBS. The NSEC3 distinction only affects
          * the algorithm identifier and the denial-of-existence records.
          *
-         * IMPORTANT: `ring`'s RSA_PKCS1_2048_8192_SHA1 parameter set
-         * refuses to verify moduli smaller than 2048 bits. Many legacy
-         * algorithm-5/7 zones (e.g. CentralNic .com style zones such as
-         * uk.com, eu.com, us.com) still publish 1024-bit RSA keys.
-         *
-         * Therefore we try `ring` first (fast path, well-audited) and
-         * fall back to the pure-Rust `rsa` crate, which has no modulus
-         * size floor, when `ring` cannot handle the key.
+         * ring's RSA_PKCS1_2048_8192_SHA1 parameter set refuses moduli
+         * smaller than 2048 bits. Many legacy algorithm-5/7 zones
+         * (e.g. CentralNic .com style zones such as uk.com, eu.com,
+         * us.com) still publish 1024-bit RSA ZSKs, so we fall back to
+         * the pure-Rust `rsa` crate, which has no modulus size floor.
          */
         Algorithm::RSASHA1 | Algorithm::RSASHA1NSEC3SHA1 => {
             let Some((exponent, modulus)) = parse_rsa_public_key(pubkey_bytes) else {
@@ -298,14 +201,11 @@ pub fn verify_signature(
             tracing::debug!(
                 alg = ?algorithm,
                 modulus_bits = modulus.len() * 8,
-                exponent_bytes = exponent.len(),
                 tbs_len = message.len(),
                 sig_len = sig.len(),
                 "[crypto] RSA/SHA-1 verification attempt"
             );
 
-            // Fast path: ring, only when modulus is large enough for
-            // ring's RSA_PKCS1_2048_8192_SHA1 parameter set.
             if modulus.len() >= RING_RSA_MIN_MODULUS_BYTES {
                 let components = signature::RsaPublicKeyComponents {
                     n: modulus,
@@ -330,14 +230,11 @@ pub fn verify_signature(
                 );
             }
 
-            // Fallback path: pure-Rust `rsa` crate, no size floor.
             verify_rsa_sha1_via_rsa_crate(exponent, modulus, message, sig)
         }
 
         Algorithm::RSASHA256 | Algorithm::RSASHA512 => {
-            let Some((exponent, modulus)) =
-                parse_rsa_public_key(pubkey_bytes)
-            else {
+            let Some((exponent, modulus)) = parse_rsa_public_key(pubkey_bytes) else {
                 return false;
             };
 
@@ -353,21 +250,20 @@ pub fn verify_signature(
                 e: exponent,
             };
 
-            components
-                .verify(verify_alg, message, sig)
-                .is_ok()
+            if components.verify(verify_alg, message, sig).is_ok() {
+                return true;
+            }
+
+            if modulus.len() < RING_RSA_MIN_MODULUS_BYTES
+                && algorithm == Algorithm::RSASHA256
+            {
+                return verify_rsa_sha256_via_rsa_crate(exponent, modulus, message, sig);
+            }
+
+            false
         }
 
         Algorithm::ECDSAP256SHA256 => {
-            /*
-             * DNSSEC stores the ECDSA public key as:
-             *
-             *   X || Y
-             *
-             * while ring expects:
-             *
-             *   0x04 || X || Y
-             */
             let mut full_key = Vec::with_capacity(65);
             full_key.push(0x04);
             full_key.extend_from_slice(pubkey_bytes);
@@ -381,15 +277,6 @@ pub fn verify_signature(
         }
 
         Algorithm::ECDSAP384SHA384 => {
-            /*
-             * DNSSEC stores:
-             *
-             *   X || Y
-             *
-             * ring expects:
-             *
-             *   0x04 || X || Y
-             */
             let mut full_key = Vec::with_capacity(97);
             full_key.push(0x04);
             full_key.extend_from_slice(pubkey_bytes);
@@ -411,23 +298,15 @@ pub fn verify_signature(
             key.verify(message, sig).is_ok()
         }
 
-        /*
-         * DNSSEC algorithm 18.
-         *
-         * The resolver currently maps this to ML-DSA-44.
-         */
-        Algorithm::Unknown(18) => {
-            verify_mldsa44(pubkey_bytes, message, sig)
-        }
+        Algorithm::Unknown(18) => verify_mldsa44(pubkey_bytes, message, sig),
 
         _ => false,
     }
 }
 
-/// Pure-Rust RSA/SHA-1 PKCS#1 v1.5 verification using the `rsa` crate.
-///
-/// This has no modulus-size floor and is used as the fallback for
-/// algorithm 5 / 7 DNSKEYs whose modulus is smaller than 2048 bits.
+/// Pure-Rust RSA/SHA-1 PKCS#1 v1.5 verification via the `rsa` crate.
+/// Used as the fallback for algorithm 5 / 7 DNSKEYs whose modulus is
+/// below ring's 2048-bit floor.
 fn verify_rsa_sha1_via_rsa_crate(
     exponent: &[u8],
     modulus: &[u8],
@@ -442,9 +321,9 @@ fn verify_rsa_sha1_via_rsa_crate(
         return false;
     };
 
-    let vk = RsaVerifyingKey::<Sha1>::new(key);
+    let vk = RsaVK::<Sha1>::new(key);
 
-    let Ok(sig_obj) = RsaPkcs1v15Signature::try_from(sig) else {
+    let Ok(sig_obj) = RsaSig::try_from(sig) else {
         tracing::debug!(
             sig_len = sig.len(),
             "[crypto] rsa crate could not parse PKCS#1 v1.5 signature"
@@ -467,43 +346,74 @@ fn verify_rsa_sha1_via_rsa_crate(
     }
 }
 
+/// Pure-Rust RSA/SHA-256 PKCS#1 v1.5 verification via the `rsa` crate.
+/// Used as the fallback for algorithm 8 DNSKEYs whose modulus is below
+/// ring's 2048-bit floor.
+fn verify_rsa_sha256_via_rsa_crate(
+    exponent: &[u8],
+    modulus: &[u8],
+    message: &[u8],
+    sig: &[u8],
+) -> bool {
+    let n = BigUint::from_bytes_be(modulus);
+    let e = BigUint::from_bytes_be(exponent);
+
+    let Ok(key) = RsaPublicKey::new(n, e) else {
+        tracing::debug!("[crypto] rsa crate rejected RSA public key");
+        return false;
+    };
+
+    let vk = RsaVK::<Sha256>::new(key);
+
+    let Ok(sig_obj) = RsaSig::try_from(sig) else {
+        tracing::debug!(
+            sig_len = sig.len(),
+            "[crypto] rsa crate could not parse PKCS#1 v1.5 signature"
+        );
+        return false;
+    };
+
+    match vk.verify(message, &sig_obj) {
+        Ok(()) => {
+            tracing::debug!("[crypto] rsa crate RSA/SHA-256 verification OK");
+            true
+        }
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "[crypto] rsa crate RSA/SHA-256 verification failed"
+            );
+            false
+        }
+    }
+}
+
 /// Verify an ML-DSA-44 DNSSEC signature.
 pub fn verify_mldsa44(
     pubkey_bytes: &[u8],
     message: &[u8],
     sig: &[u8],
 ) -> bool {
-    let Ok(vk_enc) =
-        EncodedVerifyingKey::<MlDsa44>::try_from(pubkey_bytes)
-    else {
+    let Ok(vk_enc) = EncodedVerifyingKey::<MlDsa44>::try_from(pubkey_bytes) else {
         tracing::debug!(
             len = pubkey_bytes.len(),
             "[DNSSEC] ML-DSA-44 public key has wrong length (expected 1312)"
         );
-
         return false;
     };
 
     let vk = MlDsaVerifyingKey::<MlDsa44>::decode(&vk_enc);
 
-    let Ok(sig_enc) =
-        EncodedSignature::<MlDsa44>::try_from(sig)
-    else {
+    let Ok(sig_enc) = EncodedSignature::<MlDsa44>::try_from(sig) else {
         tracing::debug!(
             len = sig.len(),
             "[DNSSEC] ML-DSA-44 signature has wrong length (expected 2420)"
         );
-
         return false;
     };
 
-    let Some(sig_obj) =
-        MlDsaSignature::<MlDsa44>::decode(&sig_enc)
-    else {
-        tracing::debug!(
-            "[DNSSEC] ML-DSA-44 signature decode failed"
-        );
-
+    let Some(sig_obj) = MlDsaSignature::<MlDsa44>::decode(&sig_enc) else {
+        tracing::debug!("[DNSSEC] ML-DSA-44 signature decode failed");
         return false;
     };
 
@@ -514,15 +424,13 @@ pub fn verify_mldsa44(
 ///
 /// DNSKEY RSA public keys are encoded as:
 ///
-///   exponent length
+///   exponent length (1 or 3 bytes)
 ///   exponent
 ///   modulus
 ///
 /// If the first length byte is zero, the exponent length is encoded
 /// as a 16-bit value in the next two bytes.
-pub fn parse_rsa_public_key(
-    bytes: &[u8],
-) -> Option<(&[u8], &[u8])> {
+pub fn parse_rsa_public_key(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
     if bytes.is_empty() {
         return None;
     }
@@ -531,10 +439,7 @@ pub fn parse_rsa_public_key(
         if bytes.len() < 3 {
             return None;
         }
-
-        let len =
-            u16::from_be_bytes([bytes[1], bytes[2]]) as usize;
-
+        let len = u16::from_be_bytes([bytes[1], bytes[2]]) as usize;
         (len, &bytes[3..])
     } else {
         (bytes[0] as usize, &bytes[1..])
@@ -546,19 +451,9 @@ pub fn parse_rsa_public_key(
 
     let (exponent, modulus) = rest.split_at(exp_len);
 
-    /*
-     * ring's RSA verification path only accepts reasonable RSA
-     * modulus sizes. DNSSEC RSA keys should not be tiny.
-     *
-     * NOTE: We lowered the minimum here from 128 to 64 bytes so that
-     * legacy 512-bit keys (rare, but seen historically) can be routed
-     * through the `rsa` crate fallback. Keys below 512 bits should
-     * really be treated as bogus regardless.
-     */
-    if modulus.is_empty()
-        || modulus.len() < 64
-        || modulus.len() > 1024
-    {
+    // Sanity bounds. Floor is 64 bytes (512 bits) so legacy short keys
+    // can still route through the `rsa` crate fallback.
+    if modulus.is_empty() || modulus.len() < 64 || modulus.len() > 1024 {
         return None;
     }
 
