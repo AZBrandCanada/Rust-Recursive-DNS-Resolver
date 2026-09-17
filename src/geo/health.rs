@@ -58,6 +58,17 @@ pub struct NodeHealth {
     last_check_at: AtomicU64,
     total_success: AtomicU64,
     total_failure: AtomicU64,
+    /// Unix timestamp of the most recent peer heartbeat received from
+    /// this node, or 0 if no heartbeat has ever been received (mesh
+    /// disabled or the peer has never successfully connected).
+    peer_last_heartbeat_at: AtomicU64,
+    /// Unix timestamp of when this health entry was created. Used as
+    /// the baseline for the startup grace period before a silent peer
+    /// is presumed dead.
+    registered_at: u64,
+    /// Whether the peer last reported itself as healthy. Only valid
+    /// when peer_last_heartbeat_at > 0.
+    peer_reported_healthy: AtomicU8,
 }
 
 impl Default for NodeHealth {
@@ -70,6 +81,9 @@ impl Default for NodeHealth {
             last_check_at: AtomicU64::new(0),
             total_success: AtomicU64::new(0),
             total_failure: AtomicU64::new(0),
+            peer_last_heartbeat_at: AtomicU64::new(0),
+            peer_reported_healthy: AtomicU8::new(1),
+            registered_at: now_secs(),
         }
     }
 }
@@ -138,6 +152,48 @@ impl NodeHealth {
             other => other,
         };
         self.state.store(new as u8, Ordering::Relaxed);
+    }
+
+    /// Apply an authenticated peer heartbeat from this node.
+    pub fn apply_peer_heartbeat(&self, reported_healthy: bool, _reported_at: u64) {
+        self.peer_last_heartbeat_at
+            .store(now_secs(), Ordering::Relaxed);
+        self.peer_reported_healthy
+            .store(reported_healthy as u8, Ordering::Relaxed);
+    }
+
+    /// Whether this node should be excluded from selection based on
+    /// peer mesh signal alone.
+    ///
+    /// Caller must ensure the peer mesh is enabled before using this.
+    /// When the mesh is disabled, do not call this (or always treat
+    /// the result as `false`).
+    ///
+    /// Behavior:
+    ///   * If a heartbeat has been received and it explicitly said
+    ///     `healthy=false`, exclude immediately.
+    ///   * If the last heartbeat is older than `3 * interval`,
+    ///     exclude (stale).
+    ///   * If no heartbeat has ever been received, apply a startup
+    ///     grace period of `3 * interval` from the time this entry
+    ///     was registered. After the grace period, treat as failed.
+    ///     Before it, allow (in case the mesh is just starting up).
+    pub fn excluded_by_peer_mesh(&self, now: u64, heartbeat_interval_secs: u64) -> bool {
+        let grace = heartbeat_interval_secs.saturating_mul(3);
+        let last = self.peer_last_heartbeat_at.load(Ordering::Relaxed);
+
+        if last == 0 {
+            // Never heard from this peer. Enforce grace period from
+            // registration time so a slow mesh startup doesn't cause
+            // all peers to be excluded at t=0.
+            return now.saturating_sub(self.registered_at) > grace;
+        }
+
+        if now.saturating_sub(last) > grace {
+            return true;
+        }
+
+        self.peer_reported_healthy.load(Ordering::Relaxed) == 0
     }
 }
 

@@ -43,23 +43,46 @@ pub struct GeoRouter {
     health: Arc<HealthRegistry>,
     #[allow(dead_code)]
     hysteresis_pct: u8,
+    /// Peer heartbeat interval used to compute the mesh staleness
+    /// window. Passed in from GeoConfig at construction.
+    peer_heartbeat_interval_secs: u64,
+    /// Whether the peer mesh is configured and running. When false,
+    /// peer-based exclusion is skipped entirely so a standalone
+    /// deployment is not penalized by the absence of heartbeats.
+    peer_mesh_enabled: bool,
 }
 
 impl GeoRouter {
-    pub fn new(nodes: &[GeoNode], health: Arc<HealthRegistry>, hysteresis_pct: u8) -> Self {
+    pub fn new(
+        nodes: &[GeoNode],
+        health: Arc<HealthRegistry>,
+        hysteresis_pct: u8,
+        peer_heartbeat_interval_secs: u64,
+        peer_mesh_enabled: bool,
+    ) -> Self {
         Self {
             nodes: nodes.to_vec(),
             health,
             hysteresis_pct,
+            peer_heartbeat_interval_secs,
+            peer_mesh_enabled,
         }
     }
 
     /// Score all eligible nodes and return them sorted best-first.
+    ///
+    /// A node is excluded when either its local health check has
+    /// marked it Unhealthy, or the peer mesh has declared it
+    /// unavailable (silent past the staleness window, or explicitly
+    /// self-reported unhealthy).
     pub fn score_all(
         &self,
         client: Option<&ClientLocation>,
         need_ipv6: bool,
     ) -> Vec<ScoreBreakdown> {
+        let now = crate::cache::now_secs();
+        let interval = self.peer_heartbeat_interval_secs;
+
         let mut scores: Vec<ScoreBreakdown> = self
             .nodes
             .iter()
@@ -69,6 +92,9 @@ impl GeoRouter {
                 let h = self.health.get(&n.name)?;
                 let state = h.current();
                 if state == HealthState::Unhealthy {
+                    return None;
+                }
+                if self.peer_mesh_enabled && h.excluded_by_peer_mesh(now, interval) {
                     return None;
                 }
                 Some(self.score_node(n, &h, client, state))

@@ -71,6 +71,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(async move {
             geo::health::run_loop(cfg, registry).await;
         });
+
+        // Peer mesh — Phase 1.5
+        if let Some(self_name) = geo_config.self_node.clone() {
+            if !geo_config.peer_secret.is_empty() {
+                let targets = geo_config.peer_targets();
+                if targets.is_empty() {
+                    tracing::info!(
+                        self_node = %self_name,
+                        "[PEER] no peer targets configured; mesh disabled"
+                    );
+                } else {
+                    let secret = geo_config.peer_secret.clone();
+                    let interval = std::time::Duration::from_secs(
+                        geo_config.peer_heartbeat_interval_secs,
+                    );
+                    let registry = state.health.clone();
+                    let allow_insecure_tls = std::env::var("PEER_INSECURE_TLS")
+                        .ok()
+                        .as_deref()
+                        == Some("1");
+
+                    tokio::spawn(async move {
+                        geo::peer::run_heartbeat_loop(
+                            self_name,
+                            secret,
+                            interval,
+                            targets,
+                            registry,
+                            allow_insecure_tls,
+                        )
+                        .await;
+                    });
+                }
+            } else {
+                tracing::info!(
+                    "[PEER] GEO_PEER_SECRET not set; peer mesh disabled"
+                );
+            }
+        } else {
+            tracing::info!(
+                "[PEER] GEO_SELF_NODE not set; peer mesh disabled"
+            );
+        }
+
         Some(state)
     } else {
         tracing::info!("[GEO] routing disabled (set GEO_ROUTING_ENABLED=1 to enable)");

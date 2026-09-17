@@ -11,6 +11,7 @@
 // src/geo/mesh.rs, not here.
 
 pub mod authoritative;
+pub mod peer;
 pub mod config;
 pub mod geoip;
 pub mod health;
@@ -51,8 +52,16 @@ impl GeoState {
             }
         });
 
+        let peer_mesh_enabled =
+            config.self_node.is_some() && !config.peer_secret.is_empty();
         let health = Arc::new(HealthRegistry::new(&config.nodes));
-        let router = GeoRouter::new(&config.nodes, health.clone(), config.hysteresis_pct);
+        let router = GeoRouter::new(
+            &config.nodes,
+            health.clone(),
+            config.hysteresis_pct,
+            config.peer_heartbeat_interval_secs,
+            peer_mesh_enabled,
+        );
         let authoritative_names = config.authoritative_names.clone();
 
         tracing::info!(
@@ -76,5 +85,24 @@ impl GeoState {
 
     pub fn is_authoritative_for(&self, qname: &Name) -> bool {
         self.authoritative_names.iter().any(|n| n == qname)
+    }
+
+    /// Apply an authenticated peer heartbeat to the health registry.
+    /// Called by the /internal/peer-heartbeat handler after signature
+    /// verification and IP allowlist checks.
+    pub fn apply_peer_heartbeat(&self, payload: crate::geo::peer::HeartbeatPayload) {
+        let Some(h) = self.health.get(&payload.node) else {
+            tracing::debug!(
+                node = %payload.node,
+                "[PEER] heartbeat for unknown node; ignoring"
+            );
+            return;
+        };
+        h.apply_peer_heartbeat(payload.healthy, payload.timestamp);
+        tracing::debug!(
+            node = %payload.node,
+            healthy = payload.healthy,
+            "[PEER] heartbeat applied"
+        );
     }
 }

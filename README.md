@@ -1557,6 +1557,9 @@ Environment="CACHE_PREFETCH=1"
 #Environment="ROOT_ZONE_REFRESH_HOURS=168"
 
 # Geo-aware GSLB
+Environment=GEO_PEER_SECRET="HEX SECRET KEY" #FOR HEARTBEATS MUST BE THE SAME ON ALL NODES
+Environment=GEO_PEER_HEARTBEAT_INTERVAL=10
+
 Environment="GEO_IP_FAILOVER_IP=3"
 Environment="GEO_ROUTING_ENABLED=1"
 Environment="GEO_AUTHORITATIVE_NAMES=dns.example.com"
@@ -1570,6 +1573,7 @@ Environment="NODE1_LOCATION=asia"
 Environment="NODE1_LAT=1.3521"
 Environment="NODE1_LON=103.8198"
 Environment="NODE1_ENABLED=true"
+Environment=NODE1_DOH_URL="https://dns1.example.ca" #FOR HEARTBEATS AND FAILOVER
 
 Environment="NODE2_NAME=europe-1"
 Environment="NODE2_IPV4=191.221.231.111"
@@ -1577,6 +1581,7 @@ Environment="NODE2_LOCATION=europe"
 Environment="NODE2_LAT=52.5200"
 Environment="NODE2_LON=13.4050"
 Environment="NODE2_ENABLED=true"
+Environment=NODE2_DOH_URL="https://dns2.example.ca" #FOR HEARTBEATS AND FAILOVER
 
 Environment="NODE3_NAME=usa-1"
 Environment="NODE3_IPV4=191.221.102.212"
@@ -1584,6 +1589,7 @@ Environment="NODE3_LOCATION=north_america"
 Environment="NODE3_LAT=40.7128"
 Environment="NODE3_LON=-74.0060"
 Environment="NODE3_ENABLED=true"
+Environment=NODE2_DOH_URL="https://dns3.example.ca"  #FOR HEARTBEATS AND FAILOVER
 
 # Logging
 Environment="RUST_LOG=info,unified_dns=info"

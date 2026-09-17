@@ -104,6 +104,85 @@ async fn handle_h3_request(
         return;
     }
 
+    if path == "/internal/peer-heartbeat" {
+        // Peer mesh heartbeat. Read body, then defer to the shared
+        // handler. The IP allowlist is enforced inside the handler.
+        let Some(geo) = state.geo.as_ref() else {
+            let _ = stream
+                .send_response(
+                    Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(())
+                        .unwrap(),
+                )
+                .await;
+            let _ = stream.finish().await;
+            return;
+        };
+
+        if !geo.config.peer_allowed_ips.contains(&client_ip) {
+            let _ = stream
+                .send_response(
+                    Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(())
+                        .unwrap(),
+                )
+                .await;
+            let _ = stream.finish().await;
+            return;
+        }
+
+        let sig = req
+            .headers()
+            .get("x-peer-signature")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        let mut body = Vec::new();
+        while let Ok(Some(mut chunk)) = stream.recv_data().await {
+            while chunk.has_remaining() {
+                let slice = chunk.chunk();
+                body.extend_from_slice(slice);
+                let len = slice.len();
+                chunk.advance(len);
+            }
+            if body.len() > 4096 {
+                break;
+            }
+        }
+
+        let status = match (sig.as_deref(), geo.config.peer_secret.is_empty()) {
+            (_, true) => StatusCode::NOT_FOUND,
+            (None, _) => StatusCode::UNAUTHORIZED,
+            (Some(s), _) => {
+                if !crate::geo::peer::verify(&geo.config.peer_secret, &body, s) {
+                    StatusCode::UNAUTHORIZED
+                } else {
+                    match serde_json::from_slice::<crate::geo::peer::HeartbeatPayload>(&body) {
+                        Ok(payload) => {
+                            let now = crate::cache::now_secs();
+                            let skew = (now as i64 - payload.timestamp as i64).unsigned_abs();
+                            if skew > 60 {
+                                StatusCode::BAD_REQUEST
+                            } else {
+                                geo.apply_peer_heartbeat(payload);
+                                StatusCode::NO_CONTENT
+                            }
+                        }
+                        Err(_) => StatusCode::BAD_REQUEST,
+                    }
+                }
+            }
+        };
+
+        if let Ok(resp) = Response::builder().status(status).body(()) {
+            let _ = stream.send_response(resp).await;
+            let _ = stream.finish().await;
+        }
+        return;
+    }
+
     if path != "/dns-query" {
         if let Ok(resp) = Response::builder().status(StatusCode::NOT_FOUND).body(()) {
             let _ = stream.send_response(resp).await;

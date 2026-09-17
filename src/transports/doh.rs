@@ -28,6 +28,7 @@ pub fn build_doh_router(state: AppState) -> Router {
         )
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
+        .route("/internal/peer-heartbeat", axum::routing::post(handle_peer_heartbeat))
         .layer(DefaultBodyLimit::max(MAX_DOH_PAYLOAD))
         .with_state(state)
 }
@@ -219,6 +220,64 @@ pub fn decode_dns_param(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
     let pad_len = (4 - (s.len() % 4)) % 4;
     let padded = format!("{}{}", s, "=".repeat(pad_len));
     BASE64_STANDARD.decode(padded)
+}
+
+/// POST /internal/peer-heartbeat
+///
+/// Inter-node health mesh receiver. Returns 404 for any request from
+/// a non-allowlisted source or when the mesh is not configured, so
+/// the endpoint is not discoverable. Signature is HMAC-SHA256 over
+/// the raw request body, hex-encoded in `X-Peer-Signature`.
+async fn handle_peer_heartbeat(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(geo) = state.geo.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    if !geo.config.peer_allowed_ips.contains(&peer.ip()) {
+        tracing::debug!(
+            client = %peer.ip(),
+            "[PEER] heartbeat from non-allowlisted source"
+        );
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let sig = match headers.get("x-peer-signature").and_then(|v| v.to_str().ok()) {
+        Some(s) => s.to_string(),
+        None => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+
+    if !crate::geo::peer::verify(&geo.config.peer_secret, &body, &sig) {
+        tracing::warn!(
+            client = %peer.ip(),
+            "[PEER] heartbeat signature verification failed"
+        );
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let payload: crate::geo::peer::HeartbeatPayload = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    let now = crate::cache::now_secs();
+    let skew = (now as i64 - payload.timestamp as i64).unsigned_abs();
+    if skew > 60 {
+        tracing::warn!(
+            client = %peer.ip(),
+            node = %payload.node,
+            skew_secs = skew,
+            "[PEER] heartbeat outside acceptable time skew"
+        );
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    geo.apply_peer_heartbeat(payload);
+    StatusCode::NO_CONTENT.into_response()
 }
 
 fn make_dns_response(bytes: Vec<u8>) -> Response {

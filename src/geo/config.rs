@@ -45,6 +45,20 @@ pub struct GeoConfig {
     /// best-effort steering instead of strict steering.
     /// Clamped to [1, 16].
     pub response_ip_count: u8,
+
+    // ─── Peer mesh (Phase 1.5) ────────────────────────────────────────
+    /// Name of this node, matching one of the NODE<N>_NAME values.
+    /// If unset, the peer mesh is disabled.
+    pub self_node: Option<String>,
+    /// HMAC-SHA256 shared secret, as a hex string. If unset, the peer
+    /// mesh is disabled.
+    pub peer_secret: Vec<u8>,
+    /// Seconds between outbound peer heartbeats.
+    pub peer_heartbeat_interval_secs: u64,
+    /// Source IPs allowed to reach the peer heartbeat endpoint.
+    /// Derived from all NODE<N>_IPV4 and NODE<N>_IPV6 values (including
+    /// self) plus any explicit entries in GEO_PEER_EXTRA_ALLOWED_IPS.
+    pub peer_allowed_ips: Vec<std::net::IpAddr>,
 }
 
 impl GeoConfig {
@@ -93,6 +107,67 @@ impl GeoConfig {
         let hysteresis_pct = env_u8("GEO_HYSTERESIS_PCT", 15).min(50);
         let response_ip_count = env_u8("GEO_IP_FAILOVER_IP", 1).clamp(1, 16);
 
+        // ─── Peer mesh config ─────────────────────────────────────────
+        let self_node = env_str("GEO_SELF_NODE", "");
+        let self_node = if self_node.is_empty() {
+            None
+        } else {
+            Some(self_node)
+        };
+
+        let peer_secret_hex = env_str("GEO_PEER_SECRET", "");
+        let peer_secret = if peer_secret_hex.is_empty() {
+            Vec::new()
+        } else {
+            match hex_decode(&peer_secret_hex) {
+                Some(b) if b.len() >= 16 => b,
+                Some(b) => {
+                    tracing::warn!(
+                        len = b.len(),
+                        "[GEO] GEO_PEER_SECRET too short (< 16 bytes); peer mesh disabled"
+                    );
+                    Vec::new()
+                }
+                None => {
+                    tracing::warn!(
+                        "[GEO] GEO_PEER_SECRET is not valid hex; peer mesh disabled"
+                    );
+                    Vec::new()
+                }
+            }
+        };
+
+        let peer_heartbeat_interval_secs =
+            env_u64("GEO_PEER_HEARTBEAT_INTERVAL", 10).max(2);
+
+        // Allowed IPs: every NODE<N>_IPV4 and NODE<N>_IPV6, plus any
+        // explicit extras.
+        let mut peer_allowed_ips: Vec<std::net::IpAddr> = Vec::new();
+        for n in &nodes {
+            if let Some(v4) = n.ipv4 {
+                peer_allowed_ips.push(std::net::IpAddr::V4(v4));
+            }
+            if let Some(v6) = n.ipv6 {
+                peer_allowed_ips.push(std::net::IpAddr::V6(v6));
+            }
+        }
+        for s in env_str("GEO_PEER_EXTRA_ALLOWED_IPS", "")
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            match s.parse::<std::net::IpAddr>() {
+                Ok(ip) => peer_allowed_ips.push(ip),
+                Err(e) => {
+                    tracing::warn!(
+                        value = %s,
+                        error = %e,
+                        "[GEO] GEO_PEER_EXTRA_ALLOWED_IPS entry is not a valid IP; skipping"
+                    );
+                }
+            }
+        }
+
         Self {
             enabled,
             authoritative_names,
@@ -103,12 +178,45 @@ impl GeoConfig {
             default_node,
             hysteresis_pct,
             response_ip_count,
+            self_node,
+            peer_secret,
+            peer_heartbeat_interval_secs,
+            peer_allowed_ips,
         }
     }
 
     pub fn find_node(&self, name: &str) -> Option<&GeoNode> {
         self.nodes.iter().find(|n| n.name == name)
     }
+
+    /// Peer targets for the heartbeat loop: every node whose name is
+    /// not `self_node`, and that has a doh_url configured.
+    pub fn peer_targets(&self) -> Vec<super::peer::PeerTarget> {
+        let Some(self_name) = self.self_node.as_deref() else {
+            return Vec::new();
+        };
+        self.nodes
+            .iter()
+            .filter(|n| n.enabled)
+            .filter(|n| n.name != self_name)
+            .filter_map(|n| {
+                n.doh_url.as_ref().map(|url| super::peer::PeerTarget {
+                    name: n.name.clone(),
+                    base_url: url.clone(),
+                })
+            })
+            .collect()
+    }
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }
 
 fn parse_nodes() -> Vec<GeoNode> {
