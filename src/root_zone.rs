@@ -35,7 +35,6 @@ pub enum RootZoneState {
     Valid,
     StaleButUsable,
     TooOld,
-    Invalid,
     #[default]
     Missing,
 }
@@ -183,9 +182,7 @@ impl RootZoneManager {
                 );
             }
             None => {
-                tracing::info!(
-                    "[ROOT-ZONE] No local cache; downloading in background"
-                );
+                tracing::info!("[ROOT-ZONE] No local cache; downloading in background");
                 let mgr = manager.clone();
                 tokio::spawn(async move {
                     match mgr.download_and_refresh().await {
@@ -429,11 +426,6 @@ impl RootZoneManager {
     pub fn snapshot(&self) -> RootZoneStatus {
         self.status.read().unwrap().clone()
     }
-
-    /// For tests / admin: force an immediate refresh.
-    pub async fn force_refresh(&self) -> Result<(), String> {
-        self.download_and_refresh().await
-    }
 }
 
 fn classify_age(age_days: u64, max_age_days: u64) -> RootZoneState {
@@ -493,9 +485,7 @@ pub fn parse_root_zone(content: &str, source_url: &str) -> Result<RootZoneData, 
                         ttl,
                     });
                 // Attach later via glue map.
-                glue.entry(ns_name)
-                    .or_default()
-                    .extend_from_slice(&[]);
+                glue.entry(ns_name).or_default().extend_from_slice(&[]);
             }
             "A" | "AAAA" => {
                 if fields.len() < 5 {

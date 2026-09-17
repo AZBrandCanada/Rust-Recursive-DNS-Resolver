@@ -152,12 +152,9 @@ pub async fn prefetch_loop(state: AppState) {
 
                 let (result, is_leader) = sf
                     .run(sf_key, move || async move {
-                        match resolve_and_validate(&state_for_closure, &name_for_closure, qtype)
+                        resolve_and_validate(&state_for_closure, &name_for_closure, qtype)
                             .await
-                        {
-                            Ok(r) => Some(r),
-                            Err(_) => None,
-                        }
+                            .ok()
                     })
                     .await;
 
@@ -169,15 +166,11 @@ pub async fn prefetch_loop(state: AppState) {
 
                 match result {
                     Some(_) => {
-                        metrics()
-                            .prefetch_success
-                            .fetch_add(1, Ordering::Relaxed);
+                        metrics().prefetch_success.fetch_add(1, Ordering::Relaxed);
                         tracker_ref.record_prefetch_success(&key_ref);
                     }
                     None => {
-                        metrics()
-                            .prefetch_failure
-                            .fetch_add(1, Ordering::Relaxed);
+                        metrics().prefetch_failure.fetch_add(1, Ordering::Relaxed);
                         tracker_ref.record_prefetch_failure(&key_ref);
                     }
                 }

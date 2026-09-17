@@ -313,7 +313,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-
 async fn bind_udp(
     host: &str,
     preferred: u16,

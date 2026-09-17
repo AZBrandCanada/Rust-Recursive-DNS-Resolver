@@ -1,9 +1,9 @@
 // src/transports/mod.rs
 pub mod doh;
-pub mod metrics_handler;
 pub mod doh3;
 pub mod doq;
 pub mod dot;
+pub mod metrics_handler;
 pub mod quic;
 pub mod tcp;
 pub mod udp;

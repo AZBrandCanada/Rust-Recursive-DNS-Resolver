@@ -9,7 +9,7 @@ use crate::cache_config::cache_config;
 use crate::dnssec::{DnssecStatus, DnssecValidator};
 use crate::metrics::metrics;
 use crate::ratelimit::{RateLimiter, RrlAction};
-use crate::recursor::{RecursorError, RecursiveResolver};
+use crate::recursor::{RecursiveResolver, RecursorError};
 use crate::singleflight::SingleFlight;
 use dashmap::DashMap;
 use hickory_proto::op::{Message, ResponseCode};
@@ -27,7 +27,6 @@ pub struct Resolved {
     pub msg: Message,
     pub status: DnssecStatus,
     pub cached_at: u64,
-    pub kind: EntryKind,
 }
 
 #[derive(Clone)]
@@ -268,15 +267,16 @@ pub async fn process_dns_query(
 
         let (result, is_leader) = sf
             .run(key, move || async move {
-                match resolve_and_validate(&state_for_closure, &qname_for_closure, qtype).await {
-                    Ok(r) => Some(r),
-                    Err(_) => None,
-                }
+                resolve_and_validate(&state_for_closure, &qname_for_closure, qtype)
+                    .await
+                    .ok()
             })
             .await;
 
         if is_leader {
-            metrics().singleflight_leader.fetch_add(1, Ordering::Relaxed);
+            metrics()
+                .singleflight_leader
+                .fetch_add(1, Ordering::Relaxed);
         } else {
             metrics()
                 .singleflight_coalesced
@@ -434,6 +434,5 @@ pub async fn resolve_and_validate(
         msg: resp_msg,
         status: dnssec_status,
         cached_at: now,
-        kind,
     })
 }

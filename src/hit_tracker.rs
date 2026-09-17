@@ -74,7 +74,8 @@ impl HitTracker {
 
     pub fn record_prefetch_success(&self, key: &str) {
         if let Some(hit) = self.entries.get(key) {
-            hit.last_prefetch_attempt.store(now_secs(), Ordering::Relaxed);
+            hit.last_prefetch_attempt
+                .store(now_secs(), Ordering::Relaxed);
             hit.consecutive_failures.store(0, Ordering::Relaxed);
             hit.count.store(0, Ordering::Relaxed);
         }
@@ -82,16 +83,17 @@ impl HitTracker {
 
     pub fn record_prefetch_failure(&self, key: &str) {
         if let Some(hit) = self.entries.get(key) {
-            hit.last_prefetch_attempt.store(now_secs(), Ordering::Relaxed);
-            let _ = hit
-                .consecutive_failures
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    if v == u32::MAX {
-                        None
-                    } else {
-                        Some(v + 1)
-                    }
-                });
+            hit.last_prefetch_attempt
+                .store(now_secs(), Ordering::Relaxed);
+            let _ =
+                hit.consecutive_failures
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        if v == u32::MAX {
+                            None
+                        } else {
+                            Some(v + 1)
+                        }
+                    });
         }
     }
 
