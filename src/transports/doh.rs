@@ -166,7 +166,7 @@ fn handle_dns_outcome(outcome: ProcessOutcome) -> Response {
 async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
     let payload = serde_json::json!({
         "status": "healthy",
-        "cached_records": state.cache.len(),
+        "cached_records": state.cache.entry_count(),
     });
     (
         StatusCode::OK,

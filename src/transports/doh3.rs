@@ -76,7 +76,7 @@ async fn handle_h3_request(
     if path == "/health" {
         let payload = serde_json::json!({
             "status": "healthy",
-            "cached_records": state.cache.len(),
+            "cached_records": state.cache.entry_count(),
         });
         if let Ok(resp) = Response::builder()
             .status(StatusCode::OK)

@@ -1,17 +1,29 @@
 // src/cache.rs
+//
+// DNS-aware answer cache.
+//
+// Uses moka's W-TinyLFU admission to bound memory under DNS traffic
+// skew (a small number of names account for most queries). Reads are
+// lock-free and sharded; unrelated keys do not contend.
+//
+// TTL semantics are unchanged from the previous implementation:
+// freshness is derived from the authoritative TTL, reads never reset
+// the TTL, and the RFC 8767 stale policy is preserved.
+
+use crate::cache_config::cache_config;
 use crate::dnssec::DnssecStatus;
-use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_MAX_STALE_SECS: u64 = 300;
 
-/// RFC 8767 §4: Recommended small positive TTL (in seconds) when serving stale responses.
+/// RFC 8767 §4: Recommended small positive TTL (in seconds) when
+/// serving stale responses.
 pub const STALE_SERVE_TTL: u32 = 30;
 
 pub fn max_stale_secs() -> u64 {
@@ -29,6 +41,14 @@ pub enum CacheFreshness {
     Fresh,
     Stale,
     Expired,
+}
+
+/// Distinguishes positive answers from authenticated denial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum EntryKind {
+    #[default]
+    Positive,
+    Negative,
 }
 
 mod base64_bytes {
@@ -61,9 +81,14 @@ pub struct CacheEntry {
     pub min_ttl: u32,
     pub cached_at: u64,
     pub last_revalidated_at: u64,
-    /// Authoritative DNSSEC validation status. Mandatory field; legacy entries missing
-    /// this field are discarded on startup to prevent insecure downgrades.
+    /// Authoritative DNSSEC validation status. Mandatory field; legacy
+    /// entries missing this field are discarded on startup to prevent
+    /// insecure downgrades.
     pub dnssec_status: DnssecStatus,
+    /// Positive vs negative. Defaulted for backwards compatibility with
+    /// existing on-disk cache.json files.
+    #[serde(default)]
+    pub kind: EntryKind,
 }
 
 impl CacheEntry {
@@ -85,10 +110,15 @@ impl CacheEntry {
     }
 }
 
-pub type DnsCache = Arc<DashMap<String, CacheEntry>>;
+/// moka::sync::Cache is internally Arc-based and Clone. We do not wrap
+/// it in an outer Arc.
+pub type DnsCache = moka::sync::Cache<String, CacheEntry>;
 
 pub fn create_cache() -> DnsCache {
-    Arc::new(DashMap::new())
+    let cfg = cache_config();
+    moka::sync::Cache::builder()
+        .max_capacity(cfg.max_answer_entries)
+        .build()
 }
 
 pub fn now_secs() -> u64 {
@@ -167,11 +197,12 @@ pub fn save_cache_to_disk_sync<P: AsRef<Path>>(cache: &DnsCache, path: P) {
             let writer = BufWriter::new(file);
             let now = now_secs();
             let max_stale = max_stale_secs();
-            let mut map = HashMap::new();
+            // moka's iter() yields (Arc<K>, V) where V is owned.
+            let mut map: HashMap<String, CacheEntry> = HashMap::new();
 
-            for item in cache.iter() {
-                if item.value().freshness_at(now, max_stale) != CacheFreshness::Expired {
-                    map.insert(item.key().clone(), item.value().clone());
+            for (k, v) in cache.iter() {
+                if v.freshness_at(now, max_stale) != CacheFreshness::Expired {
+                    map.insert((*k).clone(), v);
                 }
             }
 

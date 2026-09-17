@@ -1,15 +1,19 @@
 // src/main.rs
 mod cache;
+mod cache_config;
 mod dnssec;
 mod engine;
+mod metrics;
 mod ratelimit;
 mod recursor;
+mod singleflight;
 mod tls;
 mod tranco;
 mod transports;
 
 use cache::{
     create_cache, load_cache_from_disk, now_secs, save_cache_to_disk_async, CacheEntry, DnsCache,
+    EntryKind,
 };
 use dashmap::DashMap;
 use engine::{calculate_cache_ttl, AppState};
@@ -49,6 +53,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     load_cache_from_disk(&cache, CACHE_FILE);
 
+    {
+        let cfg = cache_config::cache_config();
+        tracing::info!(
+            enabled = cfg.enabled,
+            max_answer_entries = cfg.max_answer_entries,
+            prefetch_enabled = cfg.prefetch_enabled,
+            prefetch_threshold_pct = cfg.prefetch_threshold_pct,
+            prefetch_min_hits = cfg.prefetch_min_hits,
+            "[CACHE] Configuration loaded"
+        );
+    }
+
     let warm_limit: usize = std::env::var("WARM_LIMIT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -79,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut interval = tokio::time::interval(Duration::from_secs(120));
         loop {
             interval.tick().await;
-            let count = persist_cache.len();
+            let count = persist_cache.entry_count();
             save_cache_to_disk_async(persist_cache.clone(), CACHE_FILE.to_string()).await;
             tracing::info!(entries = count, "[PERSIST] Cache synced to disk");
         }
@@ -127,6 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         recursor: recursor.clone(),
         rate_limiter,
         dnssec_enforce,
+        singleflight: Arc::new(singleflight::SingleFlight::new()),
         in_flight: Arc::new(DashMap::new()),
     };
 
@@ -374,6 +391,15 @@ async fn preload_domains(
                                 continue;
                             }
 
+                            let kind = if msg.response_code() == ResponseCode::NXDomain
+                                || (msg.response_code() == ResponseCode::NoError
+                                    && msg.answers().is_empty())
+                            {
+                                EntryKind::Negative
+                            } else {
+                                EntryKind::Positive
+                            };
+
                             msg.set_id(0);
                             msg.set_authoritative(false);
                             msg.set_recursion_available(true);
@@ -385,17 +411,20 @@ async fn preload_domains(
                                 let now = now_secs();
                                 let ttl = calculate_cache_ttl(&msg, status, now);
 
-                                cache_ref.insert(
-                                    cache_key,
-                                    CacheEntry {
-                                        raw_wire: wire,
-                                        min_ttl: ttl,
-                                        cached_at: now,
-                                        last_revalidated_at: now,
-                                        dnssec_status: status,
-                                    },
-                                );
-                                warmed_ref.fetch_add(1, Ordering::Relaxed);
+                                if ttl > 0 {
+                                    cache_ref.insert(
+                                        cache_key,
+                                        CacheEntry {
+                                            raw_wire: wire,
+                                            min_ttl: ttl,
+                                            cached_at: now,
+                                            last_revalidated_at: now,
+                                            dnssec_status: status,
+                                            kind,
+                                        },
+                                    );
+                                    warmed_ref.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
                     }
