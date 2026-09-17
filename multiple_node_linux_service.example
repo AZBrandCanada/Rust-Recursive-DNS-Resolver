@@ -1,0 +1,86 @@
+[Unit]
+Description=Unified DNS Server (geo GSLB node)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/my_user/dns
+
+# --- Bind address and listener ports ---
+Environment=HOST=0.0.0.0
+Environment=DNS_PORT=53
+Environment=DOT_PORT=853
+Environment=DOQ_PORT=853
+Environment=DOH_PORT=443
+Environment=DOH3_PORT=443
+
+# --- DNSSEC ---
+Environment=DNSSEC_ENFORCE=1
+
+# --- Rate limiting / stale serving ---
+Environment=RATE_LIMIT_BURST=300
+Environment=RATE_LIMIT_PER_SEC=60
+Environment=MAX_STALE_SECS=300
+
+# --- TLS: single wildcard cert works on all three nodes ---
+Environment=CERT_PATH=/etc/ssl/certs/example.com.wildcard.crt
+Environment=KEY_PATH=/etc/ssl/private/example.com.wildcard.key
+
+# --- Cache (relative to WorkingDirectory) ---
+Environment=CACHE_FILE=cache.json
+Environment=CACHE_MAX_ENTRIES=500000
+Environment=CACHE_PREFETCH=1
+
+# --- Root zone (relative to WorkingDirectory) ---
+Environment=ROOT_ZONE_FILE=root.zone
+Environment=ROOT_ZONE_REFRESH_HOURS=168
+
+# --- Pre-warm ---
+Environment=WARM_LIMIT=20000
+Environment=WARM_CONCURRENCY=6
+
+# --- Geo GSLB ---
+Environment=GEO_ROUTING_ENABLED=1
+Environment=GEO_AUTHORITATIVE_NAMES=dns.example.com
+Environment=GEOIP_DATABASE=GeoLite2-City.mmdb
+Environment=GEO_ROUTING_TTL=30
+Environment=GEO_HEALTH_INTERVAL=30
+Environment=GEO_HYSTERESIS_PCT=15
+
+# --- Node list. Identical on all three nodes. ---
+# Node 1: Asia (TEST-NET-3 range)
+Environment=NODE1_NAME=asia-1
+Environment=NODE1_IPV4=203.0.113.10
+Environment=NODE1_LOCATION=asia
+Environment=NODE1_LAT=1.3521
+Environment=NODE1_LON=103.8198
+Environment=NODE1_ENABLED=true
+
+# Node 2: Europe (TEST-NET-2 range)
+Environment=NODE2_NAME=europe-1
+Environment=NODE2_IPV4=198.51.100.20
+Environment=NODE2_LOCATION=europe
+Environment=NODE2_LAT=52.5200
+Environment=NODE2_LON=13.4050
+Environment=NODE2_ENABLED=true
+
+# Node 3: USA (TEST-NET-1 range)
+Environment=NODE3_NAME=usa-1
+Environment=NODE3_IPV4=192.0.2.30
+Environment=NODE3_LOCATION=north_america
+Environment=NODE3_LAT=40.7128
+Environment=NODE3_LON=-74.0060
+Environment=NODE3_ENABLED=true
+
+# --- Logging ---
+Environment=RUST_LOG=info,unified_dns=info
+
+ExecStart=/home/my_user/dns/target/release/unified-dns
+Restart=always
+RestartSec=2
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

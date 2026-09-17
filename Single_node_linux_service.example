@@ -1,0 +1,56 @@
+[Unit]
+Description=Unified DNS Server (single-node)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/my_user/dns
+
+# --- Bind address and listener ports ---
+Environment=HOST=0.0.0.0
+Environment=DNS_PORT=53
+Environment=DOT_PORT=853
+Environment=DOQ_PORT=853
+Environment=DOH_PORT=443
+Environment=DOH3_PORT=443
+#Environment=DOH_NO_TLS=1    # uncomment if a reverse proxy terminates TLS
+
+# --- DNSSEC ---
+Environment=DNSSEC_ENFORCE=1
+
+# --- Rate limiting ---
+Environment=RATE_LIMIT_BURST=300
+Environment=RATE_LIMIT_PER_SEC=60
+
+# --- Stale serving ---
+Environment=MAX_STALE_SECS=300
+
+# --- TLS (must match the hostname clients connect to) ---
+Environment=CERT_PATH=/etc/ssl/certs/dns.example.com.crt
+Environment=KEY_PATH=/etc/ssl/private/dns.example.com.key
+
+# --- Cache (relative paths resolve against WorkingDirectory) ---
+Environment=CACHE_FILE=cache.json
+Environment=CACHE_MAX_ENTRIES=500000
+Environment=CACHE_PREFETCH=1
+
+# --- Root zone (optional, files relative to WorkingDirectory) ---
+#Environment=ROOT_ZONE_FILE=root.zone
+#Environment=ROOT_ZONE_REFRESH_HOURS=168
+
+# --- Pre-warm ---
+Environment=WARM_LIMIT=20000
+Environment=WARM_CONCURRENCY=6
+
+# --- Logging ---
+Environment=RUST_LOG=info,unified_dns=info
+
+ExecStart=/home/my_user/dns/target/release/unified-dns
+Restart=always
+RestartSec=2
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
