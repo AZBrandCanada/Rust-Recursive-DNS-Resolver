@@ -7,6 +7,7 @@ The server provides standard DNS over **UDP/TCP**, **DNS-over-TLS (DoT)**, **DNS
 The resolver combines a client-independent canonical cache with full DNSSEC validation, authenticated positive and negative responses, DNSKEY/DS trust chains, NSEC/NSEC3 denial proofs, CNAME/DNAME processing, RFC 1982 DNSSEC time arithmetic, ML-DSA-44 DNSSEC verification, stale-answer handling, rate limiting, anti-amplification defenses, and SSRF-resistant iterative resolution.
 
 Optionally, the same process can act as a small authoritative nameserver for a configured set of GSLB names (e.g. `dns.example.com`) and return region-appropriate backend addresses to each client. This is described in **Geo-Aware DNS Steering** below.
+![Unified DNS Banner](Photo/DNS.jpeg)
 
 ---
 
