@@ -27,6 +27,7 @@ pub fn build_doh_router(state: AppState) -> Router {
                 .options(handle_doh_options),
         )
         .route("/health", get(handle_health))
+        .route("/metrics", get(handle_metrics))
         .layer(DefaultBodyLimit::max(MAX_DOH_PAYLOAD))
         .with_state(state)
 }
@@ -168,6 +169,15 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
         "status": "healthy",
         "cached_records": state.cache.entry_count(),
     });
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        payload.to_string(),
+    )
+}
+
+async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let payload = super::metrics_handler::build_metrics_payload(&state);
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
