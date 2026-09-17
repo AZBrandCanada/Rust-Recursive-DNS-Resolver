@@ -26,6 +26,12 @@ impl<T: Clone + Send + Sync + 'static> SingleFlight<T> {
         }
     }
 
+    /// Number of currently in-flight single-flight operations.
+    /// Used by the metrics endpoint.
+    pub fn in_flight_count(&self) -> usize {
+        self.inner.flights.len()
+    }
+
     /// Run `f` once for `key`. Concurrent callers with the same key
     /// share the result. Returns `(value, was_leader)` so callers can
     /// distinguish who actually did the work.

@@ -111,6 +111,7 @@ pub async fn process_dns_query(
             let freshness = entry.freshness(now);
 
             if freshness != CacheFreshness::Expired {
+                crate::hit_tracker::hit_tracker().record(&cache_key);
                 metrics().cache_hits.fetch_add(1, Ordering::Relaxed);
                 if entry.kind == EntryKind::Negative {
                     metrics().negative_hits.fetch_add(1, Ordering::Relaxed);
@@ -372,7 +373,7 @@ pub async fn process_dns_query(
 
 /// Canonical resolution + validation + cache insert. Called at most
 /// once per unique cache key at a time by single-flight.
-async fn resolve_and_validate(
+pub async fn resolve_and_validate(
     state: &AppState,
     qname: &Name,
     qtype: RecordType,

@@ -3,9 +3,12 @@ mod cache;
 mod cache_config;
 mod dnssec;
 mod engine;
+mod hit_tracker;
 mod metrics;
+mod prefetch;
 mod ratelimit;
 mod recursor;
+mod root_zone;
 mod singleflight;
 mod tls;
 mod tranco;
@@ -20,7 +23,7 @@ use engine::{calculate_cache_ttl, AppState};
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::{Name, RecordType};
 use hickory_proto::serialize::binary::BinEncodable;
-use recursor::RecursiveResolver;
+use recursor::{DelegationEntry, RecursiveResolver};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -65,6 +68,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // ─── Root zone (optional) ────────────────────────────────────────
+    load_and_install_root_zone(&recursor);
+
+    // ─── Cache pre-warming ───────────────────────────────────────────
     let warm_limit: usize = std::env::var("WARM_LIMIT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -90,6 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // ─── Cache persistence ───────────────────────────────────────────
     let persist_cache = cache.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(120));
@@ -101,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // ─── Rate limiter ────────────────────────────────────────────────
     let rl_capacity: i64 = std::env::var("RATE_LIMIT_BURST")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -147,6 +156,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         in_flight: Arc::new(DashMap::new()),
     };
 
+    // ─── Prefetch loop ───────────────────────────────────────────────
+    {
+        let prefetch_state = app_state.clone();
+        tokio::spawn(async move {
+            prefetch::prefetch_loop(prefetch_state).await;
+        });
+    }
+
+    // ─── Listeners ───────────────────────────────────────────────────
     let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     let requested_dns_port: u16 = std::env::var("DNS_PORT")
         .ok()
@@ -195,7 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key_path = std::env::var("KEY_PATH").unwrap_or_else(|_| "privkey.pem".to_string());
     let loaded_cert = tls::load_or_generate(&cert_path, &key_path)?;
 
-    // DoT (TCP 853)
+    // DoT
     let dot_tls_config = tls::dot_server_config(&loaded_cert)?;
     let dot_acceptor = TlsAcceptor::from(dot_tls_config);
     let (dot_listener, active_dot_port) = bind_tcp(&host, requested_dot_port, 8853).await?;
@@ -205,7 +223,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_dot_listener(dot_listener, dot_acceptor, dot_state, dot_sem).await;
     });
 
-    // DoQ (UDP 853 - RFC 9250)
+    // DoQ
     let doq_server_config = create_quic_server_config(&loaded_cert, vec![b"doq".to_vec()])?;
     let (doq_endpoint, active_doq_port) =
         bind_quic_endpoint(&host, requested_doq_port, 8853, doq_server_config)?;
@@ -215,7 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_doq_listener(doq_endpoint, doq_state, doq_sem).await;
     });
 
-    // DoH3 (UDP 443 - RFC 9114 / RFC 8484)
+    // DoH3
     let doh3_server_config = create_quic_server_config(&loaded_cert, vec![b"h3".to_vec()])?;
     let (doh3_endpoint, active_doh3_port) =
         bind_quic_endpoint(&host, requested_doh3_port, 8443, doh3_server_config)?;
@@ -225,7 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_doh3_listener(doh3_endpoint, doh3_state, doh3_sem).await;
     });
 
-    // DoH (TCP 443)
+    // DoH
     let (doh_test_sock, active_doh_port) = bind_tcp(&host, requested_doh_port, 8443).await?;
     drop(doh_test_sock);
 
@@ -286,6 +304,100 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn load_and_install_root_zone(recursor: &RecursiveResolver) {
+    let path = match std::env::var("ROOT_ZONE_FILE") {
+        Ok(p) if !p.is_empty() => p,
+        _ => {
+            tracing::info!("[ROOT-ZONE] ROOT_ZONE_FILE not set; using network root servers");
+            root_zone::install(root_zone::RootZoneStatus::default());
+            return;
+        }
+    };
+
+    let max_age_days: u64 = std::env::var("ROOT_ZONE_MAX_AGE_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(root_zone::DEFAULT_MAX_AGE_DAYS);
+
+    match root_zone::load_root_zone(&path) {
+        Ok(data) => {
+            let mtime = root_zone::file_mtime_secs(&path);
+            let file_age_days = if mtime > 0 {
+                Some(now_secs().saturating_sub(mtime) / 86400)
+            } else {
+                None
+            };
+
+            let state = if let Some(age) = file_age_days {
+                if age > max_age_days {
+                    root_zone::RootZoneState::TooOld
+                } else if age > max_age_days / 2 {
+                    root_zone::RootZoneState::StaleButUsable
+                } else {
+                    root_zone::RootZoneState::Valid
+                }
+            } else {
+                root_zone::RootZoneState::Valid
+            };
+
+            tracing::info!(
+                tlds = data.delegations.len(),
+                serial = data.serial,
+                file_age_days = ?file_age_days,
+                ?state,
+                path = %path,
+                "[ROOT-ZONE] Loaded local root zone"
+            );
+
+            let now = now_secs();
+            let cap = root_zone::ttl_cap();
+            let mut injected = 0usize;
+            let cache = recursor.delegation_cache();
+
+            for (tld, del) in &data.delegations {
+                if del.servers.is_empty() {
+                    continue;
+                }
+                let ttl = (del.ttl as u64).min(cap);
+                cache.insert(
+                    tld.to_string().to_lowercase(),
+                    DelegationEntry {
+                        servers: del.servers.clone(),
+                        expires_at: now.saturating_add(ttl),
+                    },
+                );
+                injected += 1;
+            }
+
+            tracing::info!(
+                injected,
+                "[ROOT-ZONE] Pre-populated delegation cache from root zone"
+            );
+
+            root_zone::install(root_zone::RootZoneStatus {
+                state,
+                serial: Some(data.serial),
+                loaded_at: Some(data.loaded_at),
+                source_path: Some(data.source_path),
+                tld_count: injected,
+                file_age_days,
+            });
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path,
+                "[ROOT-ZONE] Failed to load; using network root servers"
+            );
+            root_zone::install(root_zone::RootZoneStatus {
+                state: root_zone::RootZoneState::Invalid,
+                source_path: Some(path),
+                ..Default::default()
+            });
+        }
+    }
 }
 
 async fn bind_udp(

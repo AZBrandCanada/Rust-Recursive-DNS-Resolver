@@ -5,7 +5,8 @@ pub mod dname;
 pub mod upstream;
 
 use cname::{extract_cname_target, merge_redirection_response};
-use delegation::{delegation_ttl, find_cached_start, purge_delegation, DelegationEntry};
+pub use delegation::DelegationEntry;
+use delegation::{delegation_ttl, find_cached_start, purge_delegation};
 pub use dname::{dname_substitute, extract_dname_target, DNAME_RECORD_TYPE};
 use upstream::{filter_safe_ips, is_safe_upstream_ip, query_servers_with_fallback, ROOT_SERVERS};
 
@@ -58,6 +59,12 @@ impl RecursiveResolver {
     pub async fn resolve(&self, name: &Name, rtype: RecordType) -> Result<Message, RecursorError> {
         let mut visited: HashSet<String> = HashSet::new();
         self.resolve_internal(name, rtype, 0, &mut visited).await
+    }
+
+    /// Read-only access to the delegation cache. Used by the root
+    /// zone loader to pre-populate TLD delegations at startup.
+    pub fn delegation_cache(&self) -> &DashMap<String, DelegationEntry> {
+        &self.delegation_cache
     }
 
     fn purge_delegation_for(&self, name: &Name, rtype: RecordType) {

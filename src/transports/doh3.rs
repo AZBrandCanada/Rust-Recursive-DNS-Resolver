@@ -90,6 +90,20 @@ async fn handle_h3_request(
         return;
     }
 
+    if path == "/metrics" {
+        let payload = super::metrics_handler::build_metrics_payload(&state).to_string();
+        if let Ok(resp) = Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(())
+        {
+            let _ = stream.send_response(resp).await;
+            let _ = stream.send_data(Bytes::from(payload)).await;
+            let _ = stream.finish().await;
+        }
+        return;
+    }
+
     if path != "/dns-query" {
         if let Ok(resp) = Response::builder().status(StatusCode::NOT_FOUND).body(()) {
             let _ = stream.send_response(resp).await;
