@@ -10,7 +10,9 @@ homepage = "https://github.com/AZBrandCanada/Rust-Recursive-DNS-Resolver"
 readme = "README.md"
 keywords = ["dns", "dnssec", "resolver", "dot", "doh"]
 categories = ["network-programming"]
-
+exclude = [
+    "GeoLite2-City.mmdb", 
+]
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "http2", "query", "matched-path"] }
