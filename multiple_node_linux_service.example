@@ -58,6 +58,9 @@ Environment=NODE1_LAT=1.3521
 Environment=NODE1_LON=103.8198
 Environment=NODE1_ENABLED=true
 
+##Amount of Nodes to Show To Clients For Failover
+Environment=GEO_IP_FAILOVER_IP=2
+
 # Node 2: Europe (TEST-NET-2 range)
 Environment=NODE2_NAME=europe-1
 Environment=NODE2_IPV4=198.51.100.20

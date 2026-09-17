@@ -2,15 +2,22 @@
 //
 // Authoritative A/AAAA answer for configured GSLB names.
 //
-// The selected node's single IPv4 (or IPv6) address is returned. No
-// round-robin, no client-side reordering ambiguity — the steering is
-// enforced by returning exactly one address.
+// Returns up to `GEO_IP_FAILOVER_IP` A or AAAA records, ordered
+// best-scoring-first. When GEO_IP_FAILOVER_IP=1 (the default) this is
+// exactly one record, matching the strict-steering behavior. When set
+// higher, clients that respect DNS ordering get strict steering, and
+// clients that shuffle records get TCP-layer failover to the next
+// healthy node without needing a DNS re-resolution.
 //
-// Unsupported types return NODATA (NOERROR with empty answer).
-// On any internal failure, SERVFAIL is returned rather than falling
-// through to the recursive resolver, because this name is not meant
-// to be resolved recursively.
+// Unhealthy nodes are excluded from the response entirely. If no node
+// is eligible for the requested family:
+//   - A queries    → SERVFAIL
+//   - AAAA queries → NODATA (NOERROR with empty answer)
+//
+// The GSLB decision is computed per-request and never enters the
+// shared recursive cache.
 
+use super::config::GeoNode;
 use super::GeoState;
 use crate::engine::response::make_servfail_wire;
 use crate::engine::ProcessOutcome;
@@ -33,52 +40,73 @@ pub fn answer(
 
     let scores = geo.router.score_all(client_location.as_ref(), need_ipv6);
 
-    // Resolve the target node. In the AAAA case where no node has IPv6
-    // configured, there is nothing to select — return NODATA below.
-    let selected_name: Option<String> = match scores.first() {
-        Some(s) => Some(s.node_name.clone()),
-        None => geo.config.default_node.clone(),
+    // A node is eligible for the requested family if it has an address
+    // of the matching type. Unhealthy nodes are already filtered out
+    // of `scores`.
+    let family_matches = |n: &GeoNode| match qtype {
+        RecordType::A => n.ipv4.is_some(),
+        RecordType::AAAA => n.ipv6.is_some(),
+        _ => false,
     };
 
-    let node = selected_name
-        .as_deref()
-        .and_then(|n| geo.config.find_node(n));
+    let take_n = geo.config.response_ip_count as usize;
 
-    // Special case: AAAA query with no IPv6-capable node → NODATA.
-    // This is what any well-behaved authoritative would do.
-    if node.is_none() && qtype == RecordType::AAAA {
-        tracing::debug!(
-            qname = %qname,
-            client = %client_ip,
-            "[GEO_ROUTING] no IPv6-capable node; returning NODATA"
-        );
-        return build_nodata(req_msg, qname, client_dnssec_ok);
+    // Primary path: take up to `take_n` healthy nodes, best first.
+    let mut selected: Vec<&GeoNode> = scores
+        .iter()
+        .filter_map(|s| geo.config.find_node(&s.node_name))
+        .filter(|n| family_matches(n))
+        .take(take_n)
+        .collect();
+
+    // Fallback: no healthy nodes for this family — use the configured
+    // default node if it has the right family.
+    if selected.is_empty() {
+        if let Some(default_name) = geo.config.default_node.as_deref() {
+            if let Some(default_node) = geo.config.find_node(default_name) {
+                if family_matches(default_node) {
+                    selected.push(default_node);
+                }
+            }
+        }
     }
 
-    let node = match node {
-        Some(n) => n,
-        None => {
-            tracing::warn!(
+    // No eligible node at all.
+    if selected.is_empty() {
+        if qtype == RecordType::AAAA {
+            tracing::debug!(
                 qname = %qname,
                 client = %client_ip,
-                "[GEO_ROUTING] no eligible node and no default configured"
+                "[GEO_ROUTING] no IPv6-capable node; returning NODATA"
             );
-            return ProcessOutcome::ServFail(make_servfail_wire(
-                req_msg.id(),
-                req_msg.queries().first(),
-            ));
+            return build_nodata(req_msg, qname, client_dnssec_ok);
         }
-    };
+        tracing::warn!(
+            qname = %qname,
+            client = %client_ip,
+            "[GEO_ROUTING] no eligible node and no default configured"
+        );
+        return ProcessOutcome::ServFail(make_servfail_wire(
+            req_msg.id(),
+            req_msg.queries().first(),
+        ));
+    }
 
-    // Observability: single structured log per decision.
+    // Observability: one log line per decision. The top of the list
+    // is the primary steering target.
     let region = client_location
         .as_ref()
         .and_then(|c| c.country.clone())
         .unwrap_or_else(|| "??".to_string());
     let top = scores.first();
+    let returned_names: Vec<&str> = selected.iter().map(|n| n.name.as_str()).collect();
+    let returned_joined = returned_names.join(",");
+
     tracing::info!(
         client_region = %region,
-        selected_node = %node.name,
+        selected_node = %selected[0].name,
+        returned_nodes = %returned_joined,
+        returned_count = selected.len(),
         qtype = %qtype,
         score = ?top.map(|s| s.score),
         distance_km = ?top.and_then(|s| s.distance_km),
@@ -87,7 +115,7 @@ pub fn answer(
         "[GEO_ROUTING] decision"
     );
 
-    // Build response
+    // Build response.
     let mut resp = Message::new();
     resp.set_id(req_msg.id());
     resp.set_message_type(MessageType::Response);
@@ -106,17 +134,25 @@ pub fn answer(
 
     match qtype {
         RecordType::A => {
-            if let Some(v4) = node.ipv4 {
-                resp.add_answer(Record::from_rdata(qname.clone(), ttl, RData::A(A(v4))));
+            for node in &selected {
+                if let Some(v4) = node.ipv4 {
+                    resp.add_answer(Record::from_rdata(
+                        qname.clone(),
+                        ttl,
+                        RData::A(A(v4)),
+                    ));
+                }
             }
         }
         RecordType::AAAA => {
-            if let Some(v6) = node.ipv6 {
-                resp.add_answer(Record::from_rdata(
-                    qname.clone(),
-                    ttl,
-                    RData::AAAA(AAAA(v6)),
-                ));
+            for node in &selected {
+                if let Some(v6) = node.ipv6 {
+                    resp.add_answer(Record::from_rdata(
+                        qname.clone(),
+                        ttl,
+                        RData::AAAA(AAAA(v6)),
+                    ));
+                }
             }
         }
         _ => {}
@@ -139,9 +175,7 @@ pub fn answer(
     }
 }
 
-/// NODATA response: NOERROR, empty answer, echo the question. Used
-/// when a valid query is made for a type we intentionally do not
-/// serve (e.g. AAAA when no node has IPv6).
+/// NODATA response: NOERROR, empty answer, echo the question.
 fn build_nodata(req_msg: &Message, qname: &Name, client_dnssec_ok: bool) -> ProcessOutcome {
     let mut resp = Message::new();
     resp.set_id(req_msg.id());
@@ -165,11 +199,12 @@ fn build_nodata(req_msg: &Message, qname: &Name, client_dnssec_ok: bool) -> Proc
         resp.set_edns(edns);
     }
 
-    let _ = qname; // reserved for future use (e.g. logging)
+    let _ = qname;
     match resp.to_bytes() {
         Ok(wire) => ProcessOutcome::Success(wire),
-        Err(_) => {
-            ProcessOutcome::ServFail(make_servfail_wire(req_msg.id(), req_msg.queries().first()))
-        }
+        Err(_) => ProcessOutcome::ServFail(make_servfail_wire(
+            req_msg.id(),
+            req_msg.queries().first(),
+        )),
     }
 }

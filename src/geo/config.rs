@@ -38,6 +38,13 @@ pub struct GeoConfig {
     pub health_interval: Duration,
     pub default_node: Option<String>,
     pub hysteresis_pct: u8,
+    /// Maximum number of A/AAAA records to return per GSLB response.
+    /// 1 = strict single-IP steering (no failover at DNS layer).
+    /// 2+ = multi-IP response ordered best-first, enabling TCP-layer
+    /// failover at the cost of clients that shuffle records getting
+    /// best-effort steering instead of strict steering.
+    /// Clamped to [1, 16].
+    pub response_ip_count: u8,
 }
 
 impl GeoConfig {
@@ -84,6 +91,7 @@ impl GeoConfig {
         };
 
         let hysteresis_pct = env_u8("GEO_HYSTERESIS_PCT", 15).min(50);
+        let response_ip_count = env_u8("GEO_IP_FAILOVER_IP", 1).clamp(1, 16);
 
         Self {
             enabled,
@@ -94,6 +102,7 @@ impl GeoConfig {
             health_interval,
             default_node,
             hysteresis_pct,
+            response_ip_count,
         }
     }
 
