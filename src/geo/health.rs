@@ -179,7 +179,11 @@ impl NodeHealth {
     ///     was registered. After the grace period, treat as failed.
     ///     Before it, allow (in case the mesh is just starting up).
     pub fn excluded_by_peer_mesh(&self, now: u64, heartbeat_interval_secs: u64) -> bool {
-        let grace = heartbeat_interval_secs.saturating_mul(3);
+        // Five intervals instead of three: tolerates a few dropped
+        // heartbeats without flapping, and gives slow-starting peers
+        // (image pull, container init, etc.) time to send their first
+        // heartbeat before being presumed dead.
+        let grace = heartbeat_interval_secs.saturating_mul(5);
         let last = self.peer_last_heartbeat_at.load(Ordering::Relaxed);
 
         if last == 0 {

@@ -91,12 +91,34 @@ impl GeoRouter {
             .filter_map(|n| {
                 let h = self.health.get(&n.name)?;
                 let state = h.current();
-                if state == HealthState::Unhealthy {
+
+                // When the peer mesh is enabled, it is authoritative
+                // for cross-node health. The local UDP probe is a
+                // fallback for when the mesh is not deployed (e.g.
+                // a standalone or single-node setup).
+                //
+                // Rationale: the mesh is authenticated and reflects
+                // the peer's own self-reported state. The local probe
+                // can fail for reasons unrelated to node health —
+                // firewalls between nodes, asymmetric routing, or a
+                // probe packet being dropped — and must not override
+                // a mesh that says the node is fine.
+                if self.peer_mesh_enabled {
+                    if h.excluded_by_peer_mesh(now, interval) {
+                        tracing::debug!(
+                            node = %n.name,
+                            "[GEO] excluding peer per mesh signal"
+                        );
+                        return None;
+                    }
+                } else if state == HealthState::Unhealthy {
+                    tracing::debug!(
+                        node = %n.name,
+                        "[GEO] excluding peer per local health check (mesh disabled)"
+                    );
                     return None;
                 }
-                if self.peer_mesh_enabled && h.excluded_by_peer_mesh(now, interval) {
-                    return None;
-                }
+
                 Some(self.score_node(n, &h, client, state))
             })
             .collect();
