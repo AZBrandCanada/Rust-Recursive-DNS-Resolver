@@ -1463,7 +1463,7 @@ UDP `ANY` queries are dropped immediately to reduce their usefulness as amplific
 | `NODE<N>_LAT`               |          *(unset)* | Latitude for geographic scoring                                              |
 | `NODE<N>_LON`               |          *(unset)* | Longitude for geographic scoring                                             |
 | `NODE<N>_ENABLED`           |             `true` | Set to `false` to disable a node                                             |
-
+| `GEO_IP_FAILOVER_IP`        |             `1 or 2 or 3+ or N ` | Set to `false` to disable a node                               |
 ---
 
 # Building
@@ -1557,6 +1557,7 @@ Environment="CACHE_PREFETCH=1"
 #Environment="ROOT_ZONE_REFRESH_HOURS=168"
 
 # Geo-aware GSLB
+Environment="GEO_IP_FAILOVER_IP=3"
 Environment="GEO_ROUTING_ENABLED=1"
 Environment="GEO_AUTHORITATIVE_NAMES=dns.example.com"
 Environment="GEOIP_DATABASE=GeoLite2-City.mmdb"
