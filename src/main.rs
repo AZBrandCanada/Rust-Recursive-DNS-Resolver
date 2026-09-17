@@ -3,6 +3,7 @@ mod cache;
 mod cache_config;
 mod dnssec;
 mod engine;
+mod geo;
 mod hit_tracker;
 mod metrics;
 mod prefetch;
@@ -60,6 +61,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cache = create_cache();
     let recursor = RecursiveResolver::new();
+
+    // ─── Geo-aware GSLB layer (Phase 1) ───────────────────────────────
+    let geo_config = geo::GeoConfig::from_env();
+    let geo_state: Option<std::sync::Arc<geo::GeoState>> = if geo_config.enabled {
+        let state = geo::GeoState::new(geo_config.clone());
+        let registry = state.health.clone();
+        let cfg = geo_config.clone();
+        tokio::spawn(async move {
+            geo::health::run_loop(cfg, registry).await;
+        });
+        Some(state)
+    } else {
+        tracing::info!("[GEO] routing disabled (set GEO_ROUTING_ENABLED=1 to enable)");
+        None
+    };
 
     load_cache_from_disk(&cache, cache_file());
 
@@ -159,6 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         recursor: recursor.clone(),
         rate_limiter,
         dnssec_enforce,
+        geo: geo_state,
         singleflight: Arc::new(singleflight::SingleFlight::new()),
         in_flight: Arc::new(DashMap::new()),
     };

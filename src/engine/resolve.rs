@@ -35,6 +35,10 @@ pub struct AppState {
     pub recursor: Arc<RecursiveResolver>,
     pub rate_limiter: Arc<RateLimiter>,
     pub dnssec_enforce: bool,
+    /// Optional geo-authoritative GSLB layer. When Some, queries for
+    /// configured authoritative names are answered directly from the
+    /// geo router and never touch the recursive cache.
+    pub geo: Option<std::sync::Arc<crate::geo::GeoState>>,
     /// Single-flight for the miss path. Coalesces concurrent identical
     /// (qname, qtype, class) misses into one upstream resolution.
     pub singleflight: Arc<SingleFlight<Option<Resolved>>>,
@@ -98,6 +102,23 @@ pub async fn process_dns_query(
                 "[SECURITY] Rate limit dropped"
             );
             return ProcessOutcome::Dropped;
+        }
+    }
+
+    // Geo-authoritative override. This runs BEFORE the answer cache
+    // so per-client decisions never enter the shared recursive cache.
+    // Only names explicitly configured in GEO_AUTHORITATIVE_NAMES are
+    // affected; everything else continues through the normal path.
+    if let Some(geo) = state.geo.as_ref() {
+        if geo.config.enabled && geo.is_authoritative_for(&qname) {
+            return crate::geo::authoritative::answer(
+                geo,
+                &qname,
+                qtype,
+                client_ip,
+                &req_msg,
+                client_dnssec_ok,
+            );
         }
     }
 

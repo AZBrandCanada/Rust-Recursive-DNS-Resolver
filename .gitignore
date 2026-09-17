@@ -27,3 +27,6 @@ Tests/dns_diff_tester/run_diagnose.sh
 Tests/dns_diff_tester/diagnose_domain.py
 Tests/dns_diff_tester/diag_dnssec_chain.sh
 /verify_test/target
+Tests/dns_diff_tester/dns-benchmark.sh
+Tests/geo/doh-http2.py
+Tests/geo/test.sh
