@@ -59,8 +59,27 @@ pub fn answer(
         .take(take_n)
         .collect();
 
-    // Fallback: no healthy nodes for this family — use the configured
-    // default node if it has the right family.
+    // Fallback 1: if no nodes passed the health filter, the health
+    // signal itself is unreliable. Prefer to return all configured
+    // nodes rather than SERVFAIL — clients can pick whichever
+    // responds, which is better than no answer at all.
+    if selected.is_empty() {
+        tracing::warn!(
+            qname = %qname,
+            "[GEO_ROUTING] health filter excluded all nodes; returning all configured nodes as a fallback"
+        );
+        selected = geo
+            .config
+            .nodes
+            .iter()
+            .filter(|n| n.enabled)
+            .filter(|n| family_matches(n))
+            .take(take_n)
+            .collect();
+    }
+
+    // Fallback 2: still nothing (no nodes match family, or none
+    // enabled). Use the configured default if it matches the family.
     if selected.is_empty() {
         if let Some(default_name) = geo.config.default_node.as_deref() {
             if let Some(default_node) = geo.config.find_node(default_name) {

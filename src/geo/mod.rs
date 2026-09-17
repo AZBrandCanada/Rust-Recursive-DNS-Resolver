@@ -61,6 +61,7 @@ impl GeoState {
             config.hysteresis_pct,
             config.peer_heartbeat_interval_secs,
             peer_mesh_enabled,
+            config.self_node.clone(),
         );
         let authoritative_names = config.authoritative_names.clone();
 

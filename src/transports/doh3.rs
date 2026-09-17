@@ -121,6 +121,10 @@ async fn handle_h3_request(
         };
 
         if !geo.config.peer_allowed_ips.contains(&client_ip) {
+            tracing::debug!(
+                client = %client_ip,
+                "[PEER] h3 heartbeat from non-allowlisted source"
+            );
             let _ = stream
                 .send_response(
                     Response::builder()

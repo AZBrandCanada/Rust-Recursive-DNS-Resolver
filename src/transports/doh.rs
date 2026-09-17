@@ -238,9 +238,15 @@ async fn handle_peer_heartbeat(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    if !geo.config.peer_allowed_ips.contains(&peer.ip()) {
+    // Behind a reverse proxy (nginx, Caddy), the TCP peer is the
+    // loopback address of the proxy, not the actual peer node. Trust
+    // X-Forwarded-For / X-Real-IP when the immediate connection is
+    // from loopback, exactly as the DoH handlers do.
+    let source_ip = extract_client_ip(&headers, &peer);
+
+    if !geo.config.peer_allowed_ips.contains(&source_ip) {
         tracing::debug!(
-            client = %peer.ip(),
+            client = %source_ip,
             "[PEER] heartbeat from non-allowlisted source"
         );
         return StatusCode::NOT_FOUND.into_response();

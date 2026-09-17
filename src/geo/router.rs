@@ -50,6 +50,8 @@ pub struct GeoRouter {
     /// peer-based exclusion is skipped entirely so a standalone
     /// deployment is not penalized by the absence of heartbeats.
     peer_mesh_enabled: bool,
+    /// Name of this node. Self is never excluded by the peer mesh.
+    self_node_name: Option<String>,
 }
 
 impl GeoRouter {
@@ -59,6 +61,7 @@ impl GeoRouter {
         hysteresis_pct: u8,
         peer_heartbeat_interval_secs: u64,
         peer_mesh_enabled: bool,
+        self_node_name: Option<String>,
     ) -> Self {
         Self {
             nodes: nodes.to_vec(),
@@ -66,6 +69,7 @@ impl GeoRouter {
             hysteresis_pct,
             peer_heartbeat_interval_secs,
             peer_mesh_enabled,
+            self_node_name,
         }
     }
 
@@ -103,7 +107,8 @@ impl GeoRouter {
                 // firewalls between nodes, asymmetric routing, or a
                 // probe packet being dropped — and must not override
                 // a mesh that says the node is fine.
-                if self.peer_mesh_enabled {
+                let is_self = self.self_node_name.as_deref() == Some(n.name.as_str());
+                if self.peer_mesh_enabled && !is_self {
                     if h.excluded_by_peer_mesh(now, interval) {
                         tracing::debug!(
                             node = %n.name,
@@ -111,7 +116,7 @@ impl GeoRouter {
                         );
                         return None;
                     }
-                } else if state == HealthState::Unhealthy {
+                } else if !is_self && state == HealthState::Unhealthy {
                     tracing::debug!(
                         node = %n.name,
                         "[GEO] excluding peer per local health check (mesh disabled)"
