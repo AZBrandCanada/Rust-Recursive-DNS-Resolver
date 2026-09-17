@@ -33,29 +33,34 @@ pub fn answer(
 
     let scores = geo.router.score_all(client_location.as_ref(), need_ipv6);
 
-    // Pick top, or fall back to the configured default node.
-    let selected_name = match scores.first() {
-        Some(s) => s.node_name.clone(),
-        None => match geo.config.default_node.clone() {
-            Some(d) => d,
-            None => {
-                tracing::warn!(
-                    qname = %qname,
-                    client = %client_ip,
-                    "[GEO_ROUTING] no eligible node and no default configured"
-                );
-                return ProcessOutcome::ServFail(make_servfail_wire(
-                    req_msg.id(),
-                    req_msg.queries().first(),
-                ));
-            }
-        },
+    // Resolve the target node. In the AAAA case where no node has IPv6
+    // configured, there is nothing to select — return NODATA below.
+    let selected_name: Option<String> = match scores.first() {
+        Some(s) => Some(s.node_name.clone()),
+        None => geo.config.default_node.clone(),
     };
 
-    let node = match geo.config.find_node(&selected_name) {
+    let node = selected_name.as_deref().and_then(|n| geo.config.find_node(n));
+
+    // Special case: AAAA query with no IPv6-capable node → NODATA.
+    // This is what any well-behaved authoritative would do.
+    if node.is_none() && qtype == RecordType::AAAA {
+        tracing::debug!(
+            qname = %qname,
+            client = %client_ip,
+            "[GEO_ROUTING] no IPv6-capable node; returning NODATA"
+        );
+        return build_nodata(req_msg, qname, client_dnssec_ok);
+    }
+
+    let node = match node {
         Some(n) => n,
         None => {
-            tracing::warn!(node = %selected_name, "[GEO_ROUTING] selected node not found");
+            tracing::warn!(
+                qname = %qname,
+                client = %client_ip,
+                "[GEO_ROUTING] no eligible node and no default configured"
+            );
             return ProcessOutcome::ServFail(make_servfail_wire(
                 req_msg.id(),
                 req_msg.queries().first(),
@@ -125,5 +130,42 @@ pub fn answer(
             tracing::warn!(error = %e, "[GEO_ROUTING] response encoding failed");
             ProcessOutcome::ServFail(make_servfail_wire(req_msg.id(), req_msg.queries().first()))
         }
+    }
+}
+
+
+/// NODATA response: NOERROR, empty answer, echo the question. Used
+/// when a valid query is made for a type we intentionally do not
+/// serve (e.g. AAAA when no node has IPv6).
+fn build_nodata(req_msg: &Message, qname: &Name, client_dnssec_ok: bool) -> ProcessOutcome {
+    let mut resp = Message::new();
+    resp.set_id(req_msg.id());
+    resp.set_message_type(MessageType::Response);
+    resp.set_op_code(OpCode::Query);
+    resp.set_authoritative(true);
+    resp.set_recursion_desired(req_msg.recursion_desired());
+    resp.set_recursion_available(false);
+    resp.set_checking_disabled(req_msg.checking_disabled());
+    resp.set_response_code(ResponseCode::NoError);
+
+    for q in req_msg.queries() {
+        resp.add_query(q.clone());
+    }
+
+    if req_msg.extensions().is_some() {
+        let mut edns = Edns::new();
+        edns.set_version(0);
+        edns.set_max_payload(1232);
+        edns.set_dnssec_ok(client_dnssec_ok);
+        resp.set_edns(edns);
+    }
+
+    let _ = qname; // reserved for future use (e.g. logging)
+    match resp.to_bytes() {
+        Ok(wire) => ProcessOutcome::Success(wire),
+        Err(_) => ProcessOutcome::ServFail(make_servfail_wire(
+            req_msg.id(),
+            req_msg.queries().first(),
+        )),
     }
 }
