@@ -23,7 +23,7 @@ use engine::{calculate_cache_ttl, AppState};
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::{Name, RecordType};
 use hickory_proto::serialize::binary::BinEncodable;
-use recursor::{DelegationEntry, RecursiveResolver};
+use recursor::RecursiveResolver;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -38,8 +38,15 @@ use transports::{
     run_udp_listener,
 };
 
-const CACHE_FILE: &str = "cache.json";
-const TRANCO_FILE: &str = "tranco_list.txt";
+/// Cache and Tranco paths. Read from the environment at first use,
+/// defaulting to files relative to the process working directory.
+fn cache_file() -> String {
+    std::env::var("CACHE_FILE").unwrap_or_else(|_| "cache.json".to_string())
+}
+
+fn tranco_file() -> String {
+    std::env::var("TRANCO_FILE").unwrap_or_else(|_| "tranco_list.txt".to_string())
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -54,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cache = create_cache();
     let recursor = RecursiveResolver::new();
 
-    load_cache_from_disk(&cache, CACHE_FILE);
+    load_cache_from_disk(&cache, cache_file());
 
     {
         let cfg = cache_config::cache_config();
@@ -68,8 +75,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // ─── Root zone (optional) ────────────────────────────────────────
-    load_and_install_root_zone(&recursor);
+    // ─── Root zone (optional, managed lifecycle) ─────────────────────
+    let _root_zone = root_zone::RootZoneManager::start(recursor.clone()).await;
 
     // ─── Cache pre-warming ───────────────────────────────────────────
     let warm_limit: usize = std::env::var("WARM_LIMIT")
@@ -92,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(5)).await;
             tracing::info!(warm_limit, "[WARM] Fetching Tranco domain list...");
-            let domains = tranco::get_or_download_tranco(TRANCO_FILE, warm_limit).await;
+            let domains = tranco::get_or_download_tranco(&tranco_file(), warm_limit).await;
             preload_domains(preloader_cache, preloader_recursor, domains, concurrency).await;
         });
     }
@@ -104,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             interval.tick().await;
             let count = persist_cache.entry_count();
-            save_cache_to_disk_async(persist_cache.clone(), CACHE_FILE.to_string()).await;
+            save_cache_to_disk_async(persist_cache.clone(), cache_file().to_string()).await;
             tracing::info!(entries = count, "[PERSIST] Cache synced to disk");
         }
     });
@@ -298,7 +305,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("[SERVER] Shutdown requested. Saving cache...");
             doh_handle.shutdown();
-            save_cache_to_disk_async(cache.clone(), CACHE_FILE.to_string()).await;
+            save_cache_to_disk_async(cache.clone(), cache_file().to_string()).await;
             tracing::info!("[SERVER] Cache saved. Exiting cleanly.");
         }
     }
@@ -306,99 +313,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn load_and_install_root_zone(recursor: &RecursiveResolver) {
-    let path = match std::env::var("ROOT_ZONE_FILE") {
-        Ok(p) if !p.is_empty() => p,
-        _ => {
-            tracing::info!("[ROOT-ZONE] ROOT_ZONE_FILE not set; using network root servers");
-            root_zone::install(root_zone::RootZoneStatus::default());
-            return;
-        }
-    };
-
-    let max_age_days: u64 = std::env::var("ROOT_ZONE_MAX_AGE_DAYS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(root_zone::DEFAULT_MAX_AGE_DAYS);
-
-    match root_zone::load_root_zone(&path) {
-        Ok(data) => {
-            let mtime = root_zone::file_mtime_secs(&path);
-            let file_age_days = if mtime > 0 {
-                Some(now_secs().saturating_sub(mtime) / 86400)
-            } else {
-                None
-            };
-
-            let state = if let Some(age) = file_age_days {
-                if age > max_age_days {
-                    root_zone::RootZoneState::TooOld
-                } else if age > max_age_days / 2 {
-                    root_zone::RootZoneState::StaleButUsable
-                } else {
-                    root_zone::RootZoneState::Valid
-                }
-            } else {
-                root_zone::RootZoneState::Valid
-            };
-
-            tracing::info!(
-                tlds = data.delegations.len(),
-                serial = data.serial,
-                file_age_days = ?file_age_days,
-                ?state,
-                path = %path,
-                "[ROOT-ZONE] Loaded local root zone"
-            );
-
-            let now = now_secs();
-            let cap = root_zone::ttl_cap();
-            let mut injected = 0usize;
-            let cache = recursor.delegation_cache();
-
-            for (tld, del) in &data.delegations {
-                if del.servers.is_empty() {
-                    continue;
-                }
-                let ttl = (del.ttl as u64).min(cap);
-                cache.insert(
-                    tld.to_string().to_lowercase(),
-                    DelegationEntry {
-                        servers: del.servers.clone(),
-                        expires_at: now.saturating_add(ttl),
-                    },
-                );
-                injected += 1;
-            }
-
-            tracing::info!(
-                injected,
-                "[ROOT-ZONE] Pre-populated delegation cache from root zone"
-            );
-
-            root_zone::install(root_zone::RootZoneStatus {
-                state,
-                serial: Some(data.serial),
-                loaded_at: Some(data.loaded_at),
-                source_path: Some(data.source_path),
-                tld_count: injected,
-                file_age_days,
-            });
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                path = %path,
-                "[ROOT-ZONE] Failed to load; using network root servers"
-            );
-            root_zone::install(root_zone::RootZoneStatus {
-                state: root_zone::RootZoneState::Invalid,
-                source_path: Some(path),
-                ..Default::default()
-            });
-        }
-    }
-}
 
 async fn bind_udp(
     host: &str,

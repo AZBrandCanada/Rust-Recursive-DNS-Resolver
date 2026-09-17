@@ -8,9 +8,21 @@ use std::net::IpAddr;
 pub const MIN_DELEGATION_TTL: u64 = 300;
 pub const MAX_DELEGATION_TTL: u64 = 172_800;
 
+/// Where a delegation entry came from. Root-zone entries are managed
+/// by the root-zone manager and can be atomically replaced on update
+/// without touching dynamically-learned delegations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegationSource {
+    /// Learned during iterative resolution.
+    Dynamic,
+    /// Pre-populated from a local root zone file.
+    RootZone,
+}
+
 pub struct DelegationEntry {
     pub servers: Vec<IpAddr>,
     pub expires_at: u64,
+    pub source: DelegationSource,
 }
 
 pub fn delegation_ttl(msg: &Message) -> u64 {

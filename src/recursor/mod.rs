@@ -5,7 +5,7 @@ pub mod dname;
 pub mod upstream;
 
 use cname::{extract_cname_target, merge_redirection_response};
-pub use delegation::DelegationEntry;
+pub use delegation::{DelegationEntry, DelegationSource};
 use delegation::{delegation_ttl, find_cached_start, purge_delegation};
 pub use dname::{dname_substitute, extract_dname_target, DNAME_RECORD_TYPE};
 use upstream::{filter_safe_ips, is_safe_upstream_ip, query_servers_with_fallback, ROOT_SERVERS};
@@ -450,6 +450,7 @@ impl RecursiveResolver {
                     DelegationEntry {
                         servers: next_ips.clone(),
                         expires_at: now_secs() + ttl,
+                        source: DelegationSource::Dynamic,
                     },
                 );
 

@@ -1,8 +1,4 @@
 // src/transports/metrics_handler.rs
-//
-// Shared payload builder for the /metrics endpoint. Both DoH (HTTP/2)
-// and DoH3 (HTTP/3) call this so the JSON schema is identical.
-
 use crate::engine::AppState;
 use crate::metrics::metrics;
 use crate::root_zone::current_status;
@@ -42,6 +38,10 @@ pub fn build_metrics_payload(state: &AppState) -> serde_json::Value {
             "tld_count": rz.tld_count,
             "file_age_days": rz.file_age_days,
             "source_path": rz.source_path,
+            "source_url": rz.source_url,
+            "last_refresh_attempt": rz.last_refresh_attempt,
+            "last_refresh_success": rz.last_refresh_success,
+            "consecutive_failures": rz.consecutive_failures,
         },
     })
 }
