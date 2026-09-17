@@ -45,34 +45,50 @@ The cache stores validated DNS data and its explicit DNSSEC security state. It d
           • ANY query handling
                      │
                      ▼
-       Iterative Recursive Resolution
-       ──────────────────────────────
-       • Root → TLD → authoritative
-       • Bailiwick validation
-       • Safe glue handling
-       • CNAME/DNAME traversal
-       • IPv4-prioritized NS racing
-                     │
-                     ▼
-             DNSSEC Validation
-             ─────────────────
-             • DS/DNSKEY chains
-             • RRSIG validation
-             • NSEC/NSEC3 proofs
-             • Positive/negative validation
-             • ML-DSA-44
-                     │
-              ┌──────┴──────┐
-              ▼             ▼
-      Canonical DNS Data  DnssecStatus
-                          • Secure
+       Answer Cache Lookup  ←──────────────┐
+       ──────────────────                  │
+       • {qname}:{qtype}:IN key            │
+       • Fresh / Stale / Expired           │
+       • Bounded by moka W-TinyLFU         │
+                     │                     │
+              MISS ──┴── HIT                  │
+                     │                     │
+                     ▼                     │
+       Single-Flight Gate                  │
+       ─────────────────                   │
+       • Coalesces concurrent identical    │
+         misses into one upstream resolve  │
+                     │                     │
+                     ▼                     │
+       Iterative Recursive Resolution      │
+       ──────────────────────────────      │
+       • Root-zone / delegation cache      │
+         closest-ancestor lookup           │
+       • Root → TLD → authoritative        │
+       • Bailiwick validation              │
+       • Safe glue handling                │
+       • CNAME/DNAME traversal             │
+       • IPv4-prioritized NS racing        │
+                     │                     │
+                     ▼                     │
+             DNSSEC Validation             │
+             ─────────────────             │
+             • DS/DNSKEY chains            │
+             • RRSIG validation            │
+             • NSEC/NSEC3 proofs           │
+             • Positive/negative validation│
+             • ML-DSA-44                   │
+                     │                     │
+              ┌──────┴──────┐              │
+              ▼             ▼              │
+      Canonical DNS Data  DnssecStatus     │
+                          • Secure         │
                           • InsecureUnsigned
                           • InsecureUnknown
-                          • Bogus
-              └──────┬──────┘
-                     ▼
-                CacheEntry
-          {qname}:{qtype}:IN
+                          • Bogus          │
+              └──────┬──────┘              │
+                     ▼                     │
+                CacheEntry ────────────────┘
                      │
                      ▼
              Cache Freshness
@@ -109,10 +125,27 @@ Each cache entry contains:
 * Effective cache TTL
 * Cache timestamps
 * Explicit `DnssecStatus`
+* Positive / Negative classification
 
 Client-specific properties are generated only when serving the response.
 
 This avoids maintaining separate DO=0 and DO=1 caches and prevents one client's DNS flags from leaking into another client's response.
+
+### Cache Layer Overview
+
+The resolver maintains several logically separate caches, each with its own lifecycle and trust model:
+
+| Layer | Key | TTL source | Purpose |
+| --- | --- | --- | --- |
+| Answer cache | `{qname}:{qtype}:IN` | min(RR TTL, RRSIG remaining validity) | Canonical validated responses |
+| Negative cache | `{qname}:{qtype}:IN` (tagged `Negative`) | SOA MINTTL bounded | Authenticated NXDOMAIN / NODATA |
+| Delegation cache | zone name | NS / glue TTL, capped | Learned and root-zone-sourced delegations |
+| DNSSEC key cache | zone name | min(DNSKEY TTL, parent DS TTL) | Authenticated zone keys |
+| DNSSEC signedness cache | zone name | DS proof TTL | Proven-signed / proven-unsigned zones |
+| Root zone | TLD name (pre-populated) | Zone file TTL, capped | Root zone lifecycle |
+| Hit tracker | `{qname}:{qtype}:IN` | n/a | Popularity for prefetch decisions |
+
+These layers have independent expiration and invalidation behavior. A root zone update does not flush the answer cache. A TTL expiry on an individual delegation does not trigger a root zone refresh.
 
 ---
 
@@ -161,6 +194,11 @@ HTTP request validation distinguishes protocol errors from DNS resolution errors
 * Rate-limited request → `429 Too Many Requests`
 * Valid DNS query producing `SERVFAIL` → `200 OK` with DNS wire response
 
+The DoH router also exposes operational endpoints:
+
+* `GET /health` — lightweight liveness probe
+* `GET /metrics` — JSON snapshot of cache, single-flight, prefetch, and root zone state
+
 ### RFC 9114 / RFC 9000 DoH3 (DNS-over-HTTP/3)
 
 The server implements native HTTP/3 transport over QUIC:
@@ -170,6 +208,7 @@ The server implements native HTTP/3 transport over QUIC:
 * Supports 0-RTT session resumption and connection migration across client network transitions
 * Advertises HTTP/3 availability via `Alt-Svc: h3=":443"; ma=86400`
 * Shares the exact same request validation, canonical caching, and DNSSEC pipeline as DoH
+* Serves `/dns-query`, `/health`, and `/metrics`
 
 ### DNS TCP and DoT Framing
 
@@ -240,7 +279,7 @@ Tokio semaphores limit concurrent work to reduce resource exhaustion:
 
 The resolver does not forward requests to public recursive DNS services.
 
-Resolution begins at the IANA root server system:
+Resolution begins at the IANA root server system, or at the closest cached delegation discovered during a previous query:
 
 ```text
 Root
@@ -256,6 +295,37 @@ Final RRset
 ```
 
 The resolver independently follows referrals until the requested data or authenticated denial proof is obtained.
+
+## Delegation Cache
+
+Every delegation discovered during recursion is cached separately from answer data. A single resolution of `www.example.com` populates:
+
+```text
+com.         → .com gTLD servers
+example.com. → example.com authoritative servers
+```
+
+Subsequent queries for `mail.example.com`, `api.example.com`, or any other name inside `example.com` reuse the cached delegation and query the correct authoritative servers directly, without re-walking the root or `com` delegation.
+
+The delegation cache performs a **closest-ancestor lookup**: for a query for `a.b.c.example.com`, it searches for cached delegations at `b.c.example.com`, `c.example.com`, `example.com`, `com`, and `.`, in that order, and uses the most specific match.
+
+This is what prevents the resolver from querying the root servers once per user domain. In steady state, root server traffic is vanishingly small relative to total query volume.
+
+## Root Zone Support
+
+The resolver can optionally load the IANA root zone file and pre-populate the delegation cache with all TLD delegations at startup. With the root zone loaded, the very first query for any `.com` domain begins directly at the `.com` gTLD servers instead of the network root servers.
+
+The root zone has its own lifecycle, independent of the answer and delegation caches:
+
+* Loaded from a local JSON cache, if present and fresh
+* Otherwise loaded from a local text file (`root.zone`)
+* Otherwise downloaded in the background from IANA at startup
+* Periodically re-downloaded in-process on a configurable schedule
+* Atomically swapped into the delegation cache without touching dynamically-learned delegations
+
+Root-zone-sourced delegations are tagged with `DelegationSource::RootZone` in the delegation cache. This allows the root zone manager to update them without discarding delegations learned during normal resolution.
+
+Root zone entries have their own TTL cap (7 days) distinct from the delegation cache TTL cap (48 hours). A stale root zone does not prevent the resolver from operating; if the cached root zone is unusable, resolution falls back to live root server queries transparently.
 
 ## Dual-Stack Nameserver Racing
 
@@ -479,6 +549,10 @@ DNSSEC verification uses canonical DNS wire serialization.
 
 Owner names and signer names are normalized appropriately before constructing signed data, and RRset members are sorted according to canonical RDATA ordering before digest verification.
 
+The canonical TBS construction is implemented directly rather than relying on the protocol library's built-in serializer, which contains known correctness issues in the current dependency version.
+
+Names with embedded escape sequences (such as SOA `rname` fields containing escaped dots) are handled by iterating raw label bytes rather than re-parsing the ASCII presentation form.
+
 ## Authenticated Negative Responses
 
 Negative responses are validated cryptographically rather than trusting `NXDOMAIN` or empty answers by themselves.
@@ -520,6 +594,8 @@ NSEC3 validation implements the closest-provable-encloser model and validates:
 Opt-Out records are treated conservatively.
 
 An Opt-Out proof can establish an insecure delegation for an appropriate **DS query**, but it is not accepted as generic proof that arbitrary records do not exist inside a signed zone.
+
+When an opt-out NSEC3 covers the next-closer name for a non-DS query, the response is treated as Insecure rather than Secure, and `AD` is not set.
 
 ### NSEC3 Iteration Limits
 
@@ -569,6 +645,12 @@ The optimized `ring` backend handles supported:
 * Ed25519
 
 RSA keys are bounded to the supported 2,048–8,192-bit range.
+
+### Legacy RSA/SHA-1
+
+Algorithm 5 (RSASHA1) and Algorithm 7 (RSASHA1-NSEC3-SHA1) are still deployed across a significant portion of the DNSSEC tree, most notably the CentralNic-operated legacy `.com`-style zones (`uk.com`, `eu.com`, `us.com`, `co.com`, `de.com`, `uk.net`) and several university and government zones (`cmu.edu`, `*.go.jp`, `*.mil`).
+
+These zones frequently publish 1,024-bit RSA ZSKs, which fall below the `ring` backend's minimum modulus floor. The resolver includes a pure-Rust RSA/SHA-1 verification path specifically to handle these keys.
 
 ### Post-Quantum Cryptography
 
@@ -623,9 +705,43 @@ Canonical DNS response
 Effective TTL
 Cache timestamps
 DnssecStatus
+EntryKind (Positive or Negative)
 ```
 
 There is no separate DO=0/DO=1 cache.
+
+## Bounded Capacity and Eviction
+
+The answer cache is bounded by `CACHE_MAX_ENTRIES` (default 500,000). Admission and eviction use W-TinyLFU, which is designed for the heavily skewed access patterns typical of DNS traffic: a small number of popular names receive the majority of queries, and a naive LRU evicts hot records in favor of a burst of cold ones.
+
+The cache is sharded internally. Reads are lock-free and unrelated keys do not contend.
+
+Negative entries share the same cache and are tagged `EntryKind::Negative`, allowing per-class metrics and future per-class eviction policies.
+
+## Single-Flight Coalescing
+
+The miss path is wrapped in a per-key single-flight gate.
+
+When N clients concurrently request the same uncached `{qname}:{qtype}`, exactly one of them becomes the leader and performs the recursive resolution; the other N-1 wait on the leader's result and receive an identical response when it completes.
+
+The gate is keyed by `{qname}:{qtype}:IN`. Unrelated queries remain fully parallel. The cache-level read is not held behind any global lock.
+
+Background stale revalidation uses a separate, narrower gate so a stale revalidation of one record does not block a live miss on a different record.
+
+## Background Prefetch
+
+Cache entries are prefetched in the background when they are both **hot** and **nearing expiration**.
+
+The prefetch loop runs on a fixed tick. Each tick it prunes idle keys from the hit tracker, then iterates the tracker (not the whole cache) and considers each key for refresh. A key is eligible when:
+
+* Its cache entry is still Fresh
+* Its remaining TTL is below `CACHE_PREFETCH_THRESHOLD_PCT` of the original TTL
+* It has accumulated at least `CACHE_PREFETCH_MIN_HITS` hits
+* It is not inside the exponential backoff window after a prior failed refresh
+
+Eligible keys are refreshed through the same single-flight gate as a live miss, so a query arriving during prefetch coalesces with it. A random subset of eligible keys is accepted per tick, and each refresh is delayed by a short random jitter, to avoid synchronized refresh storms after a restart or cache warmup.
+
+Failed prefetches are subject to exponential backoff. A failed prefetch never invalidates the still-valid cached entry: the entry continues to be served until it genuinely expires, at which point normal stale-serving policy applies.
 
 ## DNSSEC-Aware Effective TTL
 
@@ -720,6 +836,22 @@ For a `Secure` response, `AD=1` requires:
 
 Stale responses never receive `AD=1`.
 
+## Test Mode
+
+Caching can be disabled at runtime via:
+
+```text
+CACHE_ENABLED=0
+```
+
+When disabled:
+
+* Cache reads are skipped
+* Cache writes are skipped
+* Single-flight remains active, so concurrent identical misses still coalesce
+
+This allows behavioral comparison between "resolver with cache" and "resolver without cache" without changing the binary.
+
 ## Persistent Cache Hygiene
 
 Cache entries are persisted periodically and on clean shutdown.
@@ -735,10 +867,6 @@ At startup:
 
 This deliberately avoids silently assigning a security state to legacy cache data.
 
-## Single-Flight Revalidation
-
-An in-flight registry prevents multiple concurrent background revalidations from independently refreshing the same cache entry.
-
 ## Tranco Pre-Warming
 
 Optional startup pre-warming can populate the cache using the Tranco Top 1M list.
@@ -746,6 +874,139 @@ Optional startup pre-warming can populate the cache using the Tranco Top 1M list
 Pre-warmed responses pass through normal recursive resolution and DNSSEC validation.
 
 Secure responses use the same DNSSEC-aware effective TTL calculation as ordinary cache entries.
+
+---
+
+# Root Zone Lifecycle
+
+When `ROOT_ZONE_FILE` is configured (or a `root.zone` file exists in the working directory), the resolver manages a local root zone with its own lifecycle.
+
+## Startup Sequence
+
+At startup the resolver attempts, in order:
+
+1. **JSON cache** — if a `root_zone.json` file exists, it is loaded and used immediately. JSON is pre-parsed, so startup is near-instant.
+2. **Text file** — if the JSON cache is absent or invalid, the resolver parses `root.zone` from disk.
+3. **Background download** — if neither is present, the resolver starts immediately and downloads the root zone in the background. Queries arriving before the download completes fall back to live root server queries.
+
+The resolver never blocks startup on a network fetch.
+
+## Refresh Loop
+
+Once loaded, the root zone is refreshed periodically by an in-process task on a configurable schedule (`ROOT_ZONE_REFRESH_HOURS`, default 168 hours = weekly).
+
+A successful refresh:
+
+1. Parses the newly downloaded zone file
+2. Validates the parse produced a plausible result (a minimum delegation count is required)
+3. Atomically replaces all `DelegationSource::RootZone` entries in the delegation cache
+4. Writes the new text file and JSON cache to disk
+5. Updates the root zone status
+
+Dynamically-learned delegations are never touched by a refresh. Only root-zone-sourced entries are updated.
+
+## Atomicity and Failure Handling
+
+If a refresh fails at any stage — network, parse, validation, write — the previous known-good root zone remains in place and in use. The failure is recorded in the status and subject to backoff.
+
+If the root zone file becomes too old (`ROOT_ZONE_MAX_AGE_DAYS`, default 30), the status is marked `TooOld` and the resolver falls back to live root server queries. The root zone is not deleted; a subsequent successful refresh restores validity.
+
+## Status and Metrics
+
+Root zone state is exposed via `/metrics`:
+
+```json
+"root_zone": {
+    "state": "Valid",
+    "serial": 2024092000,
+    "loaded_at": 1758100000,
+    "tld_count": 1487,
+    "file_age_days": 0,
+    "source_path": "root.zone",
+    "source_url": "https://www.internic.net/domain/root.zone",
+    "last_refresh_attempt": 1758100000,
+    "last_refresh_success": 1758100000,
+    "consecutive_failures": 0
+}
+```
+
+Possible `state` values:
+
+| State | Meaning |
+| --- | --- |
+| `Valid` | Loaded and within the fresh age window |
+| `StaleButUsable` | Loaded, but older than half the max age |
+| `TooOld` | Loaded, but older than the max age; resolver falls back to root servers |
+| `Invalid` | Parse or validation failed on the latest attempt |
+| `Missing` | No root zone file configured or loadable |
+
+## Root Zone vs. Delegation Cache
+
+The root zone and the delegation cache are separate layers.
+
+The root zone contains the root's delegation information. The delegation cache contains both dynamically-learned delegations and root-zone-sourced ones, distinguished by their `DelegationSource` tag.
+
+A root zone update does not flush the answer cache. A TTL expiry on an individual delegation does not trigger a root zone refresh. They have independent expiration mechanisms.
+
+---
+
+# Operational Monitoring
+
+The `/metrics` endpoint returns a JSON snapshot of cache, single-flight, prefetch, and root zone state. It is served by both DoH and DoH3.
+
+```bash
+curl -sk https://dns.example.com/metrics | python3 -m json.tool
+```
+
+Example response:
+
+```json
+{
+  "cache": {
+    "entries": 110,
+    "evictions": 0,
+    "hit_ratio": 0.5565,
+    "hits": 192,
+    "insertions": 81,
+    "misses": 153,
+    "stale_served": 89
+  },
+  "negative_cache": {
+    "hits": 22,
+    "insertions": 11
+  },
+  "prefetch": {
+    "attempts": 3,
+    "failure": 0,
+    "success": 3
+  },
+  "root_zone": {
+    "state": "Valid",
+    "serial": 2024092000,
+    "loaded_at": 1758100000,
+    "tld_count": 1487,
+    "file_age_days": 0,
+    "source_path": "root.zone",
+    "source_url": "https://www.internic.net/domain/root.zone",
+    "last_refresh_attempt": 1758100000,
+    "last_refresh_success": 1758100000,
+    "consecutive_failures": 0
+  },
+  "singleflight": {
+    "coalesced": 94,
+    "in_flight": 0,
+    "leaders": 59
+  }
+}
+```
+
+The `/metrics` endpoint is not authenticated. If your DoH deployment is public, consider restricting access at the reverse proxy, either by source IP allowlist or by only exposing the endpoint on a loopback port.
+
+The `/health` endpoint returns a minimal liveness payload:
+
+```json
+{ "status": "healthy", "cached_records": 110 }
+```
 
 ---
 
@@ -848,23 +1109,36 @@ UDP `ANY` queries are dropped immediately to reduce their usefulness as amplific
 
 # Environment Variables
 
-| Variable             |         Default | Description                                                                  |
-| -------------------- | --------------: | ---------------------------------------------------------------------------- |
-| `HOST`               |       `0.0.0.0` | Bind address for all listeners                                               |
-| `DNS_PORT`           |            `53` | Plain DNS port (UDP and TCP); falls back to `5053` when unprivileged         |
-| `DOT_PORT`           |           `853` | DNS-over-TLS port (TCP); falls back to `8853` when unprivileged               |
-| `DOQ_PORT`           |           `853` | DNS-over-QUIC port (UDP); falls back to `8853` when unprivileged              |
-| `DOH_PORT`           |           `443` | DNS-over-HTTPS (HTTP/1.1 & HTTP/2) port (TCP); falls back to `8443`         |
-| `DOH3_PORT`          |           `443` | DNS-over-HTTP/3 (QUIC) port (UDP); falls back to `8443`                      |
-| `DOH_NO_TLS`         |             `0` | Set to `1` when TLS is terminated upstream by a reverse proxy                |
-| `DNSSEC_ENFORCE`     |             `1` | Return `SERVFAIL` when DNSSEC validation fails                               |
-| `MAX_STALE_SECS`     |           `300` | Maximum stale-serving window                                                 |
-| `RATE_LIMIT_BURST`   |           `300` | Token-bucket burst capacity per client subnet                                |
-| `RATE_LIMIT_PER_SEC` |            `60` | Token-bucket refill rate per second                                          |
-| `CERT_PATH`          | `fullchain.pem` | TLS certificate chain                                                        |
-| `KEY_PATH`           |   `privkey.pem` | TLS private key                                                              |
-| `WARM_LIMIT`         |             `0` | Number of Tranco domains to pre-warm; `0` disables pre-warming               |
-| `WARM_CONCURRENCY`   |             `6` | Maximum concurrent pre-warming operations                                    |
+| Variable                    |            Default | Description                                                                  |
+| --------------------------- | -----------------: | ---------------------------------------------------------------------------- |
+| `HOST`                      |          `0.0.0.0` | Bind address for all listeners                                               |
+| `DNS_PORT`                  |               `53` | Plain DNS port (UDP and TCP); falls back to `5053` when unprivileged         |
+| `DOT_PORT`                  |              `853` | DNS-over-TLS port (TCP); falls back to `8853` when unprivileged               |
+| `DOQ_PORT`                  |              `853` | DNS-over-QUIC port (UDP); falls back to `8853` when unprivileged              |
+| `DOH_PORT`                  |              `443` | DNS-over-HTTPS (HTTP/1.1 & HTTP/2) port (TCP); falls back to `8443`           |
+| `DOH3_PORT`                 |              `443` | DNS-over-HTTP/3 (QUIC) port (UDP); falls back to `8443`                       |
+| `DOH_NO_TLS`                |                `0` | Set to `1` when TLS is terminated upstream by a reverse proxy                |
+| `DNSSEC_ENFORCE`            |                `1` | Return `SERVFAIL` when DNSSEC validation fails                               |
+| `MAX_STALE_SECS`            |              `300` | Maximum stale-serving window                                                 |
+| `RATE_LIMIT_BURST`          |              `300` | Token-bucket burst capacity per client subnet                                |
+| `RATE_LIMIT_PER_SEC`        |               `60` | Token-bucket refill rate per second                                          |
+| `CERT_PATH`                 |    `fullchain.pem` | TLS certificate chain                                                        |
+| `KEY_PATH`                  |      `privkey.pem` | TLS private key                                                              |
+| `WARM_LIMIT`                |                `0` | Number of Tranco domains to pre-warm; `0` disables pre-warming               |
+| `WARM_CONCURRENCY`          |                `6` | Maximum concurrent pre-warming operations                                    |
+| `CACHE_FILE`                |       `cache.json` | Persistent cache path; relative paths resolve against the working directory  |
+| `TRANCO_FILE`               | `tranco_list.txt` | Tranco list cache path; relative paths resolve against the working directory |
+| `CACHE_ENABLED`             |                `1` | Set to `0` to disable answer-cache reads and writes                          |
+| `CACHE_MAX_ENTRIES`         |          `500000` | Maximum number of cached answer/negative entries                             |
+| `CACHE_PREFETCH`            |                `1` | Enable or disable background prefetch of hot records                         |
+| `CACHE_PREFETCH_THRESHOLD_PCT` |            `15` | Prefetch threshold as a percentage of original TTL                          |
+| `CACHE_PREFETCH_MIN_HITS`   |                `5` | Minimum hits before a record is eligible for prefetch                        |
+| `HIT_TRACKER_MAX_ENTRIES`   |         `100000` | Maximum keys tracked for popularity scoring                                  |
+| `ROOT_ZONE_FILE`            |        `root.zone` | Local root zone text file; relative paths resolve against working directory  |
+| `ROOT_ZONE_CACHE`           |   `root_zone.json` | Pre-parsed JSON cache; derived from `ROOT_ZONE_FILE` if unset                |
+| `ROOT_ZONE_URL`             | `https://www.internic.net/domain/root.zone` | Source URL for root zone downloads |
+| `ROOT_ZONE_MAX_AGE_DAYS`    |               `30` | Age after which the root zone is considered too old                          |
+| `ROOT_ZONE_REFRESH_HOURS`   |             `168` | In-process root zone refresh interval                                        |
 
 ---
 
@@ -879,7 +1153,7 @@ cargo build --release
 The resulting executable is:
 
 ```text
-./target/release/doh-server
+./target/release/unified-dns
 ```
 
 For privileged ports, either run with the appropriate capability or use the configured high-port fallbacks.
@@ -887,7 +1161,7 @@ For privileged ports, either run with the appropriate capability or use the conf
 For example:
 
 ```bash
-sudo setcap 'cap_net_bind_service=+ep' ./target/release/doh-server
+sudo setcap 'cap_net_bind_service=+ep' ./target/release/unified-dns
 ```
 
 ---
@@ -919,13 +1193,14 @@ Example systemd service:
 [Unit]
 Description=Unified Recursive DNS Server
 After=network.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=doh
 Group=doh
-WorkingDirectory=/var/lib/doh-server
-ExecStart=/usr/local/bin/doh-server
+WorkingDirectory=/var/lib/unified-dns
+ExecStart=/usr/local/bin/unified-dns
 
 Environment="HOST=0.0.0.0"
 Environment="DNS_PORT=53"
@@ -940,9 +1215,22 @@ Environment="RATE_LIMIT_BURST=300"
 Environment="RATE_LIMIT_PER_SEC=60"
 Environment="CERT_PATH=/etc/letsencrypt/live/dns.example.com/fullchain.pem"
 Environment="KEY_PATH=/etc/letsencrypt/live/dns.example.com/privkey.pem"
+
+# Cache: relative paths resolve against WorkingDirectory
+Environment="CACHE_FILE=cache.json"
+Environment="CACHE_MAX_ENTRIES=500000"
+Environment="CACHE_PREFETCH=1"
+
+# Root zone: drop root.zone into WorkingDirectory and it is picked up
+# automatically. No absolute paths needed.
+#Environment="ROOT_ZONE_FILE=root.zone"
+#Environment="ROOT_ZONE_REFRESH_HOURS=168"
+
+# Optional Tranco pre-warm
 Environment="WARM_LIMIT=500"
 Environment="WARM_CONCURRENCY=8"
-Environment="RUST_LOG=info,doh_server=info"
+
+Environment="RUST_LOG=info,unified_dns=info"
 
 Restart=always
 RestartSec=3
@@ -956,8 +1244,17 @@ Then:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now doh-server.service
+sudo systemctl enable --now unified-dns.service
 ```
+
+Optional: fetch the root zone once to seed local data:
+
+```bash
+sudo -u doh curl -sS -o /var/lib/unified-dns/root.zone \
+    https://www.internic.net/domain/root.zone
+```
+
+The resolver will parse it on next start and begin serving TLD delegations from the local file.
 
 ---
 
@@ -1035,6 +1332,17 @@ server {
 
     location = /health {
         proxy_pass http://doh_backend/health;
+        proxy_set_header Host $host;
+    }
+
+    # Metrics: restrict access. Do not expose to the public internet
+    # without an allowlist.
+    location = /metrics {
+        allow 127.0.0.1;
+        allow 10.0.0.0/8;
+        deny all;
+
+        proxy_pass http://doh_backend/metrics;
         proxy_set_header Host $host;
     }
 }
@@ -1118,6 +1426,12 @@ echo -n "AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB" \
   | hexdump -C
 ```
 
+## Metrics
+
+```bash
+curl -sk https://dns.example.com/metrics | python3 -m json.tool
+```
+
 ## DNSSEC Failure Test
 
 ```bash
@@ -1173,6 +1487,10 @@ flags: ... ad ...
 | UDP application truncation           | 65,535-byte receive buffer                                                                      |
 | QUIC / HTTP/3 HoL blocking           | Multiplexed, independent byte streams per DNS query via QUIC                                    |
 | Post-quantum response truncation     | Automatic TCP retry after `TC=1`                                                                |
+| Cache memory exhaustion              | Bounded W-TinyLFU admission with configurable capacity                                          |
+| Thundering herd on cache miss        | Per-key single-flight coalescing                                                                |
+| Root zone tampering                  | Downloaded over TLS; parse validation; atomic swap; previous known-good retained on failure      |
+| Stale root zone data                 | Explicit staleness states; fallback to live root servers when too old                            |
 
 ---
 
@@ -1206,11 +1524,19 @@ RFC 8767 stale responses are served with `AD=0`, regardless of their previous DN
 
 ### 7. Bound every expensive operation
 
-Recursive depth, resolution steps, redirections, concurrent connections, rate limits, and cryptographic verification are all explicitly bounded.
+Recursive depth, resolution steps, redirections, concurrent connections, rate limits, cache capacity, and cryptographic verification are all explicitly bounded.
 
 ### 8. Treat network-provided addresses as untrusted input
 
 Delegation glue and resolved nameserver addresses are filtered before they can become outbound connection targets.
+
+### 9. Separate lifecycles for separate concerns
+
+The answer cache, delegation cache, DNSSEC key caches, and root zone each have their own expiration and refresh behavior. No single mechanism governs all of them, and no single event invalidates all of them.
+
+### 10. Coalesce, don't multiply
+
+Concurrent identical requests share a single upstream resolution. Concurrent unrelated requests proceed in parallel.
 
 ---
 
