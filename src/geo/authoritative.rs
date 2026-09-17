@@ -40,7 +40,9 @@ pub fn answer(
         None => geo.config.default_node.clone(),
     };
 
-    let node = selected_name.as_deref().and_then(|n| geo.config.find_node(n));
+    let node = selected_name
+        .as_deref()
+        .and_then(|n| geo.config.find_node(n));
 
     // Special case: AAAA query with no IPv6-capable node → NODATA.
     // This is what any well-behaved authoritative would do.
@@ -110,7 +112,11 @@ pub fn answer(
         }
         RecordType::AAAA => {
             if let Some(v6) = node.ipv6 {
-                resp.add_answer(Record::from_rdata(qname.clone(), ttl, RData::AAAA(AAAA(v6))));
+                resp.add_answer(Record::from_rdata(
+                    qname.clone(),
+                    ttl,
+                    RData::AAAA(AAAA(v6)),
+                ));
             }
         }
         _ => {}
@@ -132,7 +138,6 @@ pub fn answer(
         }
     }
 }
-
 
 /// NODATA response: NOERROR, empty answer, echo the question. Used
 /// when a valid query is made for a type we intentionally do not
@@ -163,9 +168,8 @@ fn build_nodata(req_msg: &Message, qname: &Name, client_dnssec_ok: bool) -> Proc
     let _ = qname; // reserved for future use (e.g. logging)
     match resp.to_bytes() {
         Ok(wire) => ProcessOutcome::Success(wire),
-        Err(_) => ProcessOutcome::ServFail(make_servfail_wire(
-            req_msg.id(),
-            req_msg.queries().first(),
-        )),
+        Err(_) => {
+            ProcessOutcome::ServFail(make_servfail_wire(req_msg.id(), req_msg.queries().first()))
+        }
     }
 }

@@ -15,10 +15,16 @@ pub struct GeoNode {
     pub name: String,
     pub ipv4: Option<Ipv4Addr>,
     pub ipv6: Option<Ipv6Addr>,
-    pub location: Option<String>,
     pub lat: Option<f64>,
     pub lon: Option<f64>,
     pub enabled: bool,
+    /// Human-readable region tag. Retained for Phase 1.5 mesh logging
+    /// and for `GEO_DEFAULT_NODE` matching by region, not by name.
+    #[allow(dead_code)]
+    pub location: Option<String>,
+    /// Optional DoH endpoint used by the Phase 1.5 mesh for health
+    /// probes over HTTPS rather than raw UDP DNS.
+    #[allow(dead_code)]
     pub doh_url: Option<String>,
 }
 

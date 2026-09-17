@@ -1,10 +1,12 @@
 # Unified Recursive DNS Server
 
-A high-performance, lightweight, multi-protocol **iterative recursive DNS resolver written in Rust**.
+A high-performance, lightweight, multi-protocol **iterative recursive DNS resolver written in Rust**, with an optional **geo-aware authoritative GSLB layer** for steering clients to the optimal backend node.
 
 The server provides standard DNS over **UDP/TCP**, **DNS-over-TLS (DoT)**, **DNS-over-QUIC (DoQ)**, **DNS-over-HTTPS (DoH)** (HTTP/1.1 and HTTP/2), and **DNS-over-HTTP/3 (DoH3)** (QUIC) while resolving domains directly through the DNS hierarchy—from the root servers to authoritative nameservers—without forwarding queries to third-party recursive resolvers such as Google Public DNS, Cloudflare, or Quad9.
 
 The resolver combines a client-independent canonical cache with full DNSSEC validation, authenticated positive and negative responses, DNSKEY/DS trust chains, NSEC/NSEC3 denial proofs, CNAME/DNAME processing, RFC 1982 DNSSEC time arithmetic, ML-DSA-44 DNSSEC verification, stale-answer handling, rate limiting, anti-amplification defenses, and SSRF-resistant iterative resolution.
+
+Optionally, the same process can act as a small authoritative nameserver for a configured set of GSLB names (e.g. `dns.example.com`) and return region-appropriate backend addresses to each client. This is described in **Geo-Aware DNS Steering** below.
 
 ---
 
@@ -15,6 +17,8 @@ All inbound transports share a single resolution pipeline. Transport-specific pr
 A key architectural property is the strict separation between **canonical resolver state** and **client-specific wire representation**.
 
 The cache stores validated DNS data and its explicit DNSSEC security state. It does **not** store client-specific flags such as transaction IDs, RD/CD/AD state, or DO-dependent wire representations.
+
+When GSLB is enabled, a second major architectural property is that **authoritative GSLB answers never enter the recursive cache**. The GSLB decision is computed per-request from in-memory state, and the same qname can return different answers to different clients without poisoning any shared cache.
 
 ```text
        UDP :53 ─────┐
@@ -40,81 +44,61 @@ The cache stores validated DNS data and its explicit DNSSEC security state. It d
           Request Parsing & Controls
           ──────────────────────────
           • Single-question enforcement
+          • EDNS Client Subnet extraction
           • Subnet token bucket
           • UDP duplicate-domain RRL
           • ANY query handling
                      │
                      ▼
-       Answer Cache Lookup  ←──────────────┐
-       ──────────────────                  │
-       • {qname}:{qtype}:IN key            │
-       • Fresh / Stale / Expired           │
-       • Bounded by moka W-TinyLFU         │
-                     │                     │
-              MISS ──┴── HIT                  │
-                     │                     │
-                     ▼                     │
-       Single-Flight Gate                  │
-       ─────────────────                   │
-       • Coalesces concurrent identical    │
-         misses into one upstream resolve  │
-                     │                     │
-                     ▼                     │
-       Iterative Recursive Resolution      │
-       ──────────────────────────────      │
-       • Root-zone / delegation cache      │
-         closest-ancestor lookup           │
-       • Root → TLD → authoritative        │
-       • Bailiwick validation              │
-       • Safe glue handling                │
-       • CNAME/DNAME traversal             │
-       • IPv4-prioritized NS racing        │
-                     │                     │
-                     ▼                     │
-             DNSSEC Validation             │
-             ─────────────────             │
-             • DS/DNSKEY chains            │
-             • RRSIG validation            │
-             • NSEC/NSEC3 proofs           │
-             • Positive/negative validation│
-             • ML-DSA-44                   │
-                     │                     │
-              ┌──────┴──────┐              │
-              ▼             ▼              │
-      Canonical DNS Data  DnssecStatus     │
-                          • Secure         │
-                          • InsecureUnsigned
-                          • InsecureUnknown
-                          • Bogus          │
-              └──────┬──────┘              │
-                     ▼                     │
-                CacheEntry ────────────────┘
-                     │
-                     ▼
-             Cache Freshness
-          ┌──────────┼──────────┐
-          ▼          ▼          ▼
-        Fresh       Stale     Expired
-          │          │          │
-          │          │          └─► Synchronous resolution
-          │          │
-          │          └────────────► Background revalidation
-          │
-          └───────────────────────┐
-                                  ▼
-                  Client Response Construction
-                  ─────────────────────────────
-                  1. Age client-visible TTLs
-                  2. Preserve RRSIG Original TTL
-                  3. Retrieve stored DnssecStatus
-                  4. Calculate AD according to DNSSEC state
-                  5. Filter DNSSEC records when appropriate
-                  6. Apply transaction ID and client flags
-                  7. Construct client EDNS/OPT response
-                  8. Enforce response-size policy
-                                  │
-                                  ▼
-                         Final DNS Response
+          ┌────────────────────────────┐
+          │  qname ∈ GSLB names?       │
+          └──────┬──────────────┬──────┘
+                 │ yes          │ no
+                 ▼              ▼
+       Geo-Authoritative    Answer Cache Lookup
+       Steering             ───────────────────
+       ────────────         • {qname}:{qtype}:IN
+       • per-request        • Fresh / Stale / Expired
+       • GeoIP + ECS        • Bounded by moka W-TinyLFU
+       • health scoring            │
+       • single A/AAAA     MISS ───┴─── HIT
+       • never cached              │
+                 │                 ▼
+                 │       Single-Flight Gate
+                 │       ───────────────────
+                 │       • Coalesces concurrent
+                 │         identical misses
+                 │                 │
+                 │                 ▼
+                 │       Iterative Recursive Resolution
+                 │       ──────────────────────────────
+                 │       • Root-zone / delegation cache
+                 │       • Root → TLD → authoritative
+                 │       • Bailiwick validation
+                 │       • CNAME/DNAME traversal
+                 │       • IPv4-prioritized NS racing
+                 │                 │
+                 │                 ▼
+                 │         DNSSEC Validation
+                 │         ─────────────────
+                 │         • DS/DNSKEY chains
+                 │         • RRSIG validation
+                 │         • NSEC/NSEC3 proofs
+                 │         • ML-DSA-44
+                 │                 │
+                 │          ┌──────┴──────┐
+                 │          ▼             ▼
+                 │  Canonical Data   DnssecStatus
+                 │          └──────┬──────┘
+                 │                 ▼
+                 │            CacheEntry
+                 │                 │
+                 │                 ▼
+                 │       Client Response Construction
+                 │                 │
+                 └─────────────────┤
+                                   ▼
+                          Final DNS Response
 ```
 
 ### Canonical Cache Model
@@ -144,8 +128,9 @@ The resolver maintains several logically separate caches, each with its own life
 | DNSSEC signedness cache | zone name | DS proof TTL | Proven-signed / proven-unsigned zones |
 | Root zone | TLD name (pre-populated) | Zone file TTL, capped | Root zone lifecycle |
 | Hit tracker | `{qname}:{qtype}:IN` | n/a | Popularity for prefetch decisions |
+| GSLB state | node name | n/a | Health + last RTT, per-node |
 
-These layers have independent expiration and invalidation behavior. A root zone update does not flush the answer cache. A TTL expiry on an individual delegation does not trigger a root zone refresh.
+These layers have independent expiration and invalidation behavior. A root zone update does not flush the answer cache. A TTL expiry on an individual delegation does not trigger a root zone refresh. A GSLB health transition does not invalidate any cached recursive answer.
 
 ---
 
@@ -877,6 +862,306 @@ Secure responses use the same DNSSEC-aware effective TTL calculation as ordinary
 
 ---
 
+# Geo-Aware DNS Steering (GSLB)
+
+The resolver can act as a small authoritative GSLB for a configured set of names (typically one per service endpoint, e.g. `dns.example.com`). When a query arrives for one of these names, the resolver selects a backend node based on the client's apparent location and the node's measured health, then returns a **single** A or AAAA record with that node's address.
+
+## Placement in the Request Path
+
+The GSLB check runs **before** the recursive cache lookup:
+
+```
+incoming query
+      │
+      ▼
+  parse + validate
+      │
+      ▼
+  rate limit
+      │
+      ▼
+  ┌─────────────────────────────────┐
+  │  qname ∈ GEO_AUTHORITATIVE_NAMES │
+  └────┬─────────────────────┬───────┘
+       │ yes                 │ no
+       ▼                     ▼
+  GSLB authoritative     recursive cache
+  (per-request decision) (shared cache)
+       │                     │
+       ▼                     ▼
+  single A/AAAA         canonical response
+```
+
+This guarantees that per-client decisions never enter the shared recursive cache, and that two clients with different geographic origins can receive different answers for the same qname without either poisoning the other. The GSLB path is entirely separate from the recursive resolver: it does not use the delegation cache, the DNSSEC validator, or the answer cache.
+
+When the GSLB is disabled, the resolver behaves exactly as before for all names.
+
+## Node Configuration
+
+Nodes are configured entirely through environment variables. The configuration format supports an unbounded number of nodes; adding `NODE4_*`, `NODE5_*`, etc. requires no code changes.
+
+Per-node variables use the form `NODE<N>_<FIELD>` where `<N>` starts at 1 and increments without gaps:
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `NODE<N>_NAME` | yes | Unique node identifier, used in logs and metrics |
+| `NODE<N>_IPV4` | one of IPv4/IPv6 | IPv4 address returned to A queries |
+| `NODE<N>_IPV6` | one of IPv4/IPv6 | IPv6 address returned to AAAA queries |
+| `NODE<N>_LOCATION` | no | Human-readable region tag (informational only) |
+| `NODE<N>_LAT` | recommended | Latitude for geographic scoring |
+| `NODE<N>_LON` | recommended | Longitude for geographic scoring |
+| `NODE<N>_ENABLED` | no (default `true`) | Set to `false` to disable a node without removing its configuration |
+
+The parser walks `NODE1_*`, `NODE2_*`, … until it finds an unset `NODE<N>_NAME`. There is no upper bound.
+
+Example configuration for three nodes:
+
+```ini
+Environment=NODE1_NAME=asia-1
+Environment=NODE1_IPV4=101.212.112.112
+Environment=NODE1_LOCATION=asia
+Environment=NODE1_LAT=1.3521
+Environment=NODE1_LON=103.8198
+Environment=NODE1_ENABLED=true
+
+Environment=NODE2_NAME=europe-1
+Environment=NODE2_IPV4=191.221.231.111
+Environment=NODE2_LOCATION=europe
+Environment=NODE2_LAT=52.5200
+Environment=NODE2_LON=13.4050
+Environment=NODE2_ENABLED=true
+
+Environment=NODE3_NAME=usa-1
+Environment=NODE3_IPV4=191.221.102.212
+Environment=NODE3_LOCATION=north_america
+Environment=NODE3_LAT=40.7128
+Environment=NODE3_LON=-74.0060
+Environment=NODE3_ENABLED=true
+```
+
+Nodes without a configured IPv6 address are automatically excluded from AAAA selection. If no node has IPv6, AAAA queries for the GSLB name return **NODATA** (NOERROR with an empty answer), which is the correct response for a name that has no AAAA records.
+
+## Client Location Determination
+
+The client's location is derived from, in order of preference:
+
+1. **EDNS Client Subnet (ECS)** — when the upstream resolver (Google, Cloudflare, etc.) includes an ECS option, the subnet's network address is used as the GeoIP lookup key. This is the accurate case: the public resolver is telling us where the actual client is.
+2. **Raw source IP** — when ECS is absent, the connection's source address is used. This is accurate when the client speaks directly to the resolver (DoH to your own endpoint, or plain DNS from a stub), and inaccurate when the query comes through a third-party recursive resolver (the source IP is the resolver's own egress address).
+
+The ECS subnet is masked to the advertised prefix length before being used, so full client precision is never stored.
+
+The GeoIP lookup uses a local MaxMind GeoLite2-City database (`GEOIP_DATABASE`, default `GeoLite2-City.mmdb` in the working directory). Only the country code and latitude/longitude are read from the database; no other fields are queried.
+
+If the GeoIP lookup fails (missing database, unknown IP, private address), the client is treated as "unknown location" and scoring degenerates to non-geographic inputs (health and any available latency). This does not cause an error; the request is served with whatever information is available.
+
+## Selection Algorithm
+
+Each eligible node receives a weighted score:
+
+```
+score = 0.5 * geo_score + 0.3 * latency_score + 0.2 * health_score
+```
+
+Where each component is in `[0.0, 1.0]`:
+
+| Component | 1.0 at | 0.5 at | Notes |
+| --- | --- | --- | --- |
+| `geo_score` | 0 km | 5000 km | Haversine distance from client to node |
+| `latency_score` | 0 ms | 100 ms | Last successful health-check RTT |
+| `health_score` | healthy | degraded | Static per state |
+
+Unhealthy nodes are excluded entirely. Nodes missing geo or latency data receive a neutral `0.5` for that component, which makes the formula degrade gracefully to whichever components are available. On a cold start (no health data yet), the formula reduces to nearly pure geographic steering, which is the desired behavior.
+
+The scores are computed per request and never cached. This keeps the decision fresh as client location or node health changes.
+
+## Health Checking
+
+Every enabled node is probed independently on `GEO_HEALTH_INTERVAL` (default 30 seconds). The probe is a minimal UDP DNS query (`example.com A`) sent to the node's configured address on port 53. Success is measured as a valid DNS response within 3 seconds; the RTT is recorded and fed into the scoring formula.
+
+Health state transitions use a three-state machine with hysteresis:
+
+```
+Unknown ──2 successes──► Healthy ──3 failures──► Degraded ──5 failures──► Unhealthy
+   │                        ▲                                              │
+   └─── 3 failures ──► Unhealthy                                            │
+                            │                                              │
+                            └──────────────── 2 successes ─────────────────┘
+```
+
+Health checks are bounded to a maximum of three concurrent probes. Only the node addresses parsed from `NODE<N>_IPV4` and `NODE<N>_IPV6` are ever probed; no hostname from query data is used as a health-check target. This closes the obvious SSRF vector.
+
+If a node has both IPv4 and IPv6 configured, only the IPv4 address is probed. IPv6-only nodes are probed over IPv6.
+
+## Delegating a GSLB Name
+
+The resolver answers a GSLB name authoritatively only if that name is delegated to it in DNS. This section describes how to set up that delegation correctly.
+
+### Prerequisites
+
+- A parent zone you control (`example.com` in the examples below)
+- At least one node address reachable over port 53 from the public internet
+- Ability to add NS records and glue A/AAAA records in the parent zone's DNS panel
+
+The parent zone may be DNSSEC-signed. The delegated child zone is not signed (see the **DNSSEC Status** subsection below).
+
+### Choosing Nameserver Hostnames
+
+The classic pitfall is choosing nameserver hostnames for the delegated zone. Two patterns are common:
+
+**Nested (works, but requires glue):**
+```
+dns.example.com.      NS  ns1.dns.example.com.
+dns.example.com.      NS  ns2.dns.example.com.
+ns1.dns.example.com.  A   1.2.3.4
+ns2.dns.example.com.  A   5.6.7.8
+```
+
+**Flat (recommended):**
+```
+dns.example.com.      NS  ns1.example.com.
+dns.example.com.      NS  ns2.example.com.
+ns1.example.com.      A   1.2.3.4
+ns2.example.com.      A   5.6.7.8
+```
+
+The **flat pattern is strongly preferred**. In the nested pattern, `ns1.dns.example.com` lives inside the delegated zone itself, so resolvers must be given its address as **glue** in the referral from the parent. Many DNS providers do not emit glue reliably, and some resolvers will fail or loop while trying to resolve the nameserver address independently. The flat pattern avoids this entirely: `ns1.example.com` lives in the parent zone, so its A record is regular data and no glue is required.
+
+### Setup in Cloudflare
+
+Assuming the delegated name is `dns.example.com` and the three nodes are the ones configured above:
+
+**Step 1 — Add glue A records for the nameserver hostnames.**
+
+In the DNS panel for `example.com`:
+
+```
+Type: A     Name: ns1     Value: 101.212.112.112     Proxy: OFF
+Type: A     Name: ns2     Value: 191.221.231.111   Proxy: OFF
+Type: A     Name: ns3     Value: 191.221.102.212   Proxy: OFF
+```
+
+The **Proxy toggle must be off** (grey cloud). Orange-cloud proxying would terminate the DNS request at Cloudflare, defeating the entire GSLB purpose.
+
+**Step 2 — Delete any existing A records for the delegated name itself.**
+
+If the zone has records such as:
+
+```
+dns.example.com    A    1.2.3.4
+dns.example.com    A    5.6.7.8
+```
+
+delete them. They will be shadowed by the NS records anyway, but leaving them causes confusing warnings and makes the zone harder to reason about.
+
+**Step 3 — Add the NS delegation records.**
+
+```
+Type: NS     Name: dns     Value: ns1.example.com
+Type: NS     Name: dns     Value: ns2.example.com
+Type: NS     Name: dns     Value: ns3.example.com
+```
+
+In Cloudflare's UI, `Name: dns` is shorthand for `dns.example.com.`. The `Value` field takes the fully-qualified hostname.
+
+**Step 4 — Do NOT add a DS record.**
+
+If the parent zone is DNSSEC-signed and you add a DS record for the child, DNSSEC-validating resolvers will expect the child to be signed and will reject its unsigned answers. Without a DS record, the child is treated as an **insecure delegation**, which is the correct state until DNSSEC signing for the child zone is implemented (a planned follow-up phase).
+
+### The "Shadowed Records" Warning
+
+After adding the NS records, your DNS provider will likely show a warning like:
+
+> This NS record shadows 3 existing records. As a result, the shadowed records will no longer resolve publicly.
+
+This is **expected and correct**. When a name has an NS record, that name becomes a **zone cut**: the parent zone stops serving any other records at that name, and the child zone becomes authoritative instead. The A records that were previously at `dns.example.com` are now shadowed by the NS delegation, which is exactly what is desired.
+
+Click "View shadowed records" to confirm they are the A records you intended to delete, then delete them explicitly.
+
+### Propagation
+
+Once the NS delegation is in place:
+
+1. Resolvers holding a cached A record for `dns.example.com` will keep using it until the TTL expires (typically 300 seconds).
+2. Resolvers holding a cached NS record for `example.com` will keep using it until its TTL expires (typically 86400 seconds, or one day).
+3. New queries follow the delegation to your nodes.
+
+During initial deployment, you can force faster propagation by testing with public resolvers you have not used recently, or by using `+trace` to walk the delegation manually from a clean state.
+
+### Verification
+
+From any machine:
+
+```bash
+# Direct trace shows the full delegation path
+dig dns.example.com A +trace
+```
+
+Expected final section:
+
+```
+dns.example.com. 300 IN NS ns1.example.com.
+dns.example.com. 300 IN NS ns2.example.com.
+dns.example.com. 300 IN NS ns3.example.com.
+;; Received 606 bytes from 108.162.194.87#53(suzanne.ns.cloudflare.com) in 2 ms
+
+dns.example.com. 30  IN A  101.212.112.112
+;; Received 59 bytes from ns1.example.com in 193 ms
+```
+
+The last two lines are the key: the answer comes from one of your nodes (as indicated by the `from` field), not from the parent zone's nameservers, and it contains exactly one A record.
+
+From clients in different regions:
+
+```bash
+# Each should return a single IP appropriate to that client's region
+dig dns.example.com A @1.1.1.1 +short
+dig dns.example.com A @8.8.8.8 +short
+```
+
+Public resolvers that send EDNS Client Subnet will give the correct regional answer. Public resolvers that do not send ECS will give an answer based on the resolver's own egress location, which may differ from the client's.
+
+### Logging
+
+Every GSLB decision emits a single structured log line:
+
+```
+[GEO_ROUTING] decision client_region=DE selected_node=europe-1 qtype=A
+    score=0.97 distance_km=301 rtt_ms=0.14 health=healthy
+```
+
+Fields:
+
+| Field | Description |
+| --- | --- |
+| `client_region` | ISO-3166 country code from GeoIP, or `??` if unknown |
+| `selected_node` | The chosen node name |
+| `qtype` | The query type that triggered the decision |
+| `score` | The winning node's composite score |
+| `distance_km` | Haversine distance from client to node, if computable |
+| `rtt_ms` | Last measured health-check RTT to the selected node |
+| `health` | Selected node's current health state |
+
+## DNSSEC Status of the GSLB Name
+
+The GSLB name is currently delegated but not signed:
+
+- The parent zone (`example.com`) may be DNSSEC-signed
+- No DS record is published for `dns.example.com`
+- The child zone is unsigned
+
+This produces an **insecure delegation** in DNSSEC terms. Validating resolvers accept the answers without setting the AD bit, and without failing validation. The DNS responses are correct; they are simply not cryptographically authenticated.
+
+Signing the child zone (KSK/ZSK generation, RRSIG generation at answer time, DNSKEY publication, DS record at the registrar) is planned as a follow-up phase. Until then, **do not publish a DS record**, as that would cause validating resolvers to reject the unsigned answers.
+
+## Limitations
+
+- **Per-client steering relies on ECS or direct source IP.** Queries arriving through a public resolver that does not send ECS will be steered based on that resolver's own egress location, not the client's. This is inherent to GSLB behind any third-party resolver.
+- **Public resolver caching delays re-steering.** A public resolver may cache the answer for the full TTL (30 seconds by default). If a client's best node changes, the resolver will not see the new answer until the TTL expires. Lowering `GEO_ROUTING_TTL` reduces this window at the cost of higher query volume.
+- **Health checks are best-effort.** A node that is reachable but severely degraded (e.g. returning slow responses) will be marked Degraded, not Unhealthy, and may still receive some traffic.
+- **No cross-node state sharing yet.** Each node's GSLB decision is based solely on its own health data. A node with a broken route to another node may still steer clients to that node. A future phase will add an authenticated peer heartbeat between nodes.
+
+---
+
 # Root Zone Lifecycle
 
 When `ROOT_ZONE_FILE` is configured (or a `root.zone` file exists in the working directory), the resolver manages a local root zone with its own lifecycle.
@@ -937,7 +1222,6 @@ Possible `state` values:
 | `Valid` | Loaded and within the fresh age window |
 | `StaleButUsable` | Loaded, but older than half the max age |
 | `TooOld` | Loaded, but older than the max age; resolver falls back to root servers |
-| `Invalid` | Parse or validation failed on the latest attempt |
 | `Missing` | No root zone file configured or loadable |
 
 ## Root Zone vs. Delegation Cache
@@ -1042,6 +1326,8 @@ Cloud metadata addresses such as `169.254.169.254` are therefore not accepted as
 
 This prevents malicious DNS delegation data from turning the recursive resolver into an SSRF primitive.
 
+The GSLB health checker applies the same restriction: only node addresses explicitly configured through `NODE<N>_IPV4` and `NODE<N>_IPV6` are ever probed.
+
 ## Reverse-Proxy Header Protection
 
 Headers such as:
@@ -1109,6 +1395,8 @@ UDP `ANY` queries are dropped immediately to reduce their usefulness as amplific
 
 # Environment Variables
 
+## Core
+
 | Variable                    |            Default | Description                                                                  |
 | --------------------------- | -----------------: | ---------------------------------------------------------------------------- |
 | `HOST`                      |          `0.0.0.0` | Bind address for all listeners                                               |
@@ -1124,21 +1412,56 @@ UDP `ANY` queries are dropped immediately to reduce their usefulness as amplific
 | `RATE_LIMIT_PER_SEC`        |               `60` | Token-bucket refill rate per second                                          |
 | `CERT_PATH`                 |    `fullchain.pem` | TLS certificate chain                                                        |
 | `KEY_PATH`                  |      `privkey.pem` | TLS private key                                                              |
-| `WARM_LIMIT`                |                `0` | Number of Tranco domains to pre-warm; `0` disables pre-warming               |
-| `WARM_CONCURRENCY`          |                `6` | Maximum concurrent pre-warming operations                                    |
+| `RUST_LOG`                  |             `info` | Tracing filter                                                               |
+
+## Cache
+
+| Variable                    |            Default | Description                                                                  |
+| --------------------------- | -----------------: | ---------------------------------------------------------------------------- |
 | `CACHE_FILE`                |       `cache.json` | Persistent cache path; relative paths resolve against the working directory  |
-| `TRANCO_FILE`               | `tranco_list.txt` | Tranco list cache path; relative paths resolve against the working directory |
 | `CACHE_ENABLED`             |                `1` | Set to `0` to disable answer-cache reads and writes                          |
 | `CACHE_MAX_ENTRIES`         |          `500000` | Maximum number of cached answer/negative entries                             |
 | `CACHE_PREFETCH`            |                `1` | Enable or disable background prefetch of hot records                         |
 | `CACHE_PREFETCH_THRESHOLD_PCT` |            `15` | Prefetch threshold as a percentage of original TTL                          |
 | `CACHE_PREFETCH_MIN_HITS`   |                `5` | Minimum hits before a record is eligible for prefetch                        |
 | `HIT_TRACKER_MAX_ENTRIES`   |         `100000` | Maximum keys tracked for popularity scoring                                  |
+
+## Pre-Warming
+
+| Variable                    |            Default | Description                                                                  |
+| --------------------------- | -----------------: | ---------------------------------------------------------------------------- |
+| `WARM_LIMIT`                |                `0` | Number of Tranco domains to pre-warm; `0` disables pre-warming               |
+| `WARM_CONCURRENCY`          |                `6` | Maximum concurrent pre-warming operations                                    |
+| `TRANCO_FILE`               | `tranco_list.txt` | Tranco list cache path; relative paths resolve against the working directory |
+
+## Root Zone
+
+| Variable                    |            Default | Description                                                                  |
+| --------------------------- | -----------------: | ---------------------------------------------------------------------------- |
 | `ROOT_ZONE_FILE`            |        `root.zone` | Local root zone text file; relative paths resolve against working directory  |
 | `ROOT_ZONE_CACHE`           |   `root_zone.json` | Pre-parsed JSON cache; derived from `ROOT_ZONE_FILE` if unset                |
 | `ROOT_ZONE_URL`             | `https://www.internic.net/domain/root.zone` | Source URL for root zone downloads |
 | `ROOT_ZONE_MAX_AGE_DAYS`    |               `30` | Age after which the root zone is considered too old                          |
 | `ROOT_ZONE_REFRESH_HOURS`   |             `168` | In-process root zone refresh interval                                        |
+
+## Geo-Aware GSLB
+
+| Variable                    |            Default | Description                                                                  |
+| --------------------------- | -----------------: | ---------------------------------------------------------------------------- |
+| `GEO_ROUTING_ENABLED`       |                `0` | Set to `1` to enable the GSLB layer                                          |
+| `GEO_AUTHORITATIVE_NAMES`   |          *(unset)* | Comma-separated list of names this resolver is authoritative for             |
+| `GEOIP_DATABASE`            |          *(unset)* | Path to MaxMind GeoLite2-City `.mmdb` database                               |
+| `GEO_ROUTING_TTL`           |               `30` | TTL of the returned A/AAAA record                                            |
+| `GEO_HEALTH_INTERVAL`       |               `30` | Seconds between health probes per node                                       |
+| `GEO_HYSTERESIS_PCT`        |               `15` | Minimum score delta required to switch nodes (reserved)                      |
+| `GEO_DEFAULT_NODE`          |          *(unset)* | Node name used when no eligible node exists (fallback)                       |
+| `NODE<N>_NAME`              |          *(unset)* | Unique node identifier; unset `NODE<N>_NAME` terminates the list             |
+| `NODE<N>_IPV4`              |          *(unset)* | IPv4 address returned to A queries                                           |
+| `NODE<N>_IPV6`              |          *(unset)* | IPv6 address returned to AAAA queries                                        |
+| `NODE<N>_LOCATION`          |          *(unset)* | Human-readable region tag (informational)                                    |
+| `NODE<N>_LAT`               |          *(unset)* | Latitude for geographic scoring                                              |
+| `NODE<N>_LON`               |          *(unset)* | Longitude for geographic scoring                                             |
+| `NODE<N>_ENABLED`           |             `true` | Set to `false` to disable a node                                             |
 
 ---
 
@@ -1187,7 +1510,7 @@ The resolver handles `TC=1` responses by retrying the query over TCP.
 
 The resolver terminates DoT, DoQ, DoH (HTTP/1.1 and HTTP/2), and DoH3 (HTTP/3 over QUIC) directly.
 
-Example systemd service:
+Example systemd service with GSLB enabled:
 
 ```ini
 [Unit]
@@ -1202,6 +1525,7 @@ Group=doh
 WorkingDirectory=/var/lib/unified-dns
 ExecStart=/usr/local/bin/unified-dns
 
+# Listener configuration
 Environment="HOST=0.0.0.0"
 Environment="DNS_PORT=53"
 Environment="DOT_PORT=853"
@@ -1209,27 +1533,57 @@ Environment="DOQ_PORT=853"
 Environment="DOH_PORT=443"
 Environment="DOH3_PORT=443"
 Environment="DOH_NO_TLS=0"
+
+# DNSSEC enforcement
 Environment="DNSSEC_ENFORCE=1"
+
+# Rate limits and stale serving
 Environment="MAX_STALE_SECS=300"
 Environment="RATE_LIMIT_BURST=300"
 Environment="RATE_LIMIT_PER_SEC=60"
+
+# TLS
 Environment="CERT_PATH=/etc/letsencrypt/live/dns.example.com/fullchain.pem"
 Environment="KEY_PATH=/etc/letsencrypt/live/dns.example.com/privkey.pem"
 
-# Cache: relative paths resolve against WorkingDirectory
+# Cache
 Environment="CACHE_FILE=cache.json"
 Environment="CACHE_MAX_ENTRIES=500000"
 Environment="CACHE_PREFETCH=1"
 
-# Root zone: drop root.zone into WorkingDirectory and it is picked up
-# automatically. No absolute paths needed.
+# Root zone — relative paths resolve against WorkingDirectory
 #Environment="ROOT_ZONE_FILE=root.zone"
 #Environment="ROOT_ZONE_REFRESH_HOURS=168"
 
-# Optional Tranco pre-warm
-Environment="WARM_LIMIT=500"
-Environment="WARM_CONCURRENCY=8"
+# Geo-aware GSLB
+Environment="GEO_ROUTING_ENABLED=1"
+Environment="GEO_AUTHORITATIVE_NAMES=dns.example.com"
+Environment="GEOIP_DATABASE=GeoLite2-City.mmdb"
+Environment="GEO_ROUTING_TTL=30"
+Environment="GEO_HEALTH_INTERVAL=30"
 
+Environment="NODE1_NAME=asia-1"
+Environment="NODE1_IPV4=101.212.112.112"
+Environment="NODE1_LOCATION=asia"
+Environment="NODE1_LAT=1.3521"
+Environment="NODE1_LON=103.8198"
+Environment="NODE1_ENABLED=true"
+
+Environment="NODE2_NAME=europe-1"
+Environment="NODE2_IPV4=191.221.231.111"
+Environment="NODE2_LOCATION=europe"
+Environment="NODE2_LAT=52.5200"
+Environment="NODE2_LON=13.4050"
+Environment="NODE2_ENABLED=true"
+
+Environment="NODE3_NAME=usa-1"
+Environment="NODE3_IPV4=191.221.102.212"
+Environment="NODE3_LOCATION=north_america"
+Environment="NODE3_LAT=40.7128"
+Environment="NODE3_LON=-74.0060"
+Environment="NODE3_ENABLED=true"
+
+# Logging
 Environment="RUST_LOG=info,unified_dns=info"
 
 Restart=always
@@ -1247,14 +1601,19 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now unified-dns.service
 ```
 
-Optional: fetch the root zone once to seed local data:
+Optional first-time setup for GSLB:
 
 ```bash
+# Fetch root zone (for recursive performance)
 sudo -u doh curl -sS -o /var/lib/unified-dns/root.zone \
     https://www.internic.net/domain/root.zone
+
+# Download MaxMind GeoLite2-City (requires free MaxMind account)
+# https://www.maxmind.com/en/geolite2/signup
+sudo -u doh cp GeoLite2-City.mmdb /var/lib/unified-dns/
 ```
 
-The resolver will parse it on next start and begin serving TLD delegations from the local file.
+Then configure the delegation in your parent zone's DNS panel as described in the **Delegating a GSLB Name** section above.
 
 ---
 
@@ -1432,6 +1791,18 @@ echo -n "AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB" \
 curl -sk https://dns.example.com/metrics | python3 -m json.tool
 ```
 
+## GSLB Steering
+
+```bash
+# Verify the delegation resolves and returns a single A record
+dig dns.example.com A +trace
+
+# Verify that the resolver returns different regional IPs for different clients
+# (from clients in different regions, or via public resolvers)
+dig dns.example.com A @1.1.1.1 +short
+dig dns.example.com A @8.8.8.8 +short
+```
+
 ## DNSSEC Failure Test
 
 ```bash
@@ -1491,6 +1862,10 @@ flags: ... ad ...
 | Thundering herd on cache miss        | Per-key single-flight coalescing                                                                |
 | Root zone tampering                  | Downloaded over TLS; parse validation; atomic swap; previous known-good retained on failure      |
 | Stale root zone data                 | Explicit staleness states; fallback to live root servers when too old                            |
+| GSLB cache poisoning                 | GSLB decisions run before the shared cache and are never cached                                  |
+| GSLB node address injection          | Node addresses accepted only from `NODE<N>_IPV4` / `NODE<N>_IPV6` env vars                       |
+| GSLB health check SSRF               | Only configured node addresses are probed; query data is never used as a target                  |
+| ECS spoofing                         | ECS is used only for GeoIP lookup, not for routing decisions in isolation; source IP is preferred when ECS is absent |
 
 ---
 
@@ -1532,14 +1907,20 @@ Delegation glue and resolved nameserver addresses are filtered before they can b
 
 ### 9. Separate lifecycles for separate concerns
 
-The answer cache, delegation cache, DNSSEC key caches, and root zone each have their own expiration and refresh behavior. No single mechanism governs all of them, and no single event invalidates all of them.
+The answer cache, delegation cache, DNSSEC key caches, root zone, and GSLB health state each have their own expiration and refresh behavior. No single mechanism governs all of them, and no single event invalidates all of them.
 
 ### 10. Coalesce, don't multiply
 
 Concurrent identical requests share a single upstream resolution. Concurrent unrelated requests proceed in parallel.
+
+### 11. Authoritative answers never pollute the recursive cache
+
+When the resolver acts as an authoritative GSLB, the per-client steering decision is computed on the request path and never stored in the shared recursive cache. Two clients with different geographic origins can receive different answers for the same name without either affecting the other.
 
 ---
 
 # License
 
 This project is licensed under the **MIT License**.
+
+

@@ -111,11 +111,15 @@ pub async fn process_dns_query(
     // affected; everything else continues through the normal path.
     if let Some(geo) = state.geo.as_ref() {
         if geo.config.enabled && geo.is_authoritative_for(&qname) {
+            // Prefer the client subnet from ECS when present: for
+            // queries arriving via public resolvers, `client_ip` is the
+            // resolver's own egress, not the actual client.
+            let geo_lookup_ip = parsed.ecs_net.unwrap_or(client_ip);
             return crate::geo::authoritative::answer(
                 geo,
                 &qname,
                 qtype,
-                client_ip,
+                geo_lookup_ip,
                 &req_msg,
                 client_dnssec_ok,
             );

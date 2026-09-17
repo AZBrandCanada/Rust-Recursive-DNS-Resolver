@@ -25,12 +25,17 @@ use std::sync::Arc;
 pub struct ScoreBreakdown {
     pub node_name: String,
     pub score: f64,
-    pub geo_score: f64,
-    pub latency_score: f64,
-    pub health_score: f64,
     pub distance_km: Option<f64>,
     pub rtt_ms: Option<f64>,
     pub health: &'static str,
+    /// Per-component scores. Retained for Phase 2 tuning tools and for
+    /// verbose debug output when diagnosing unexpected steering.
+    #[allow(dead_code)]
+    pub geo_score: f64,
+    #[allow(dead_code)]
+    pub latency_score: f64,
+    #[allow(dead_code)]
+    pub health_score: f64,
 }
 
 pub struct GeoRouter {
@@ -79,6 +84,9 @@ impl GeoRouter {
     }
 
     /// Return the best node name, or None if no eligible nodes exist.
+    /// Convenience wrapper around `score_all` for callers that only
+    /// need the winner, not the breakdown. Retained as stable API.
+    #[allow(dead_code)]
     pub fn select(&self, client: Option<&ClientLocation>, need_ipv6: bool) -> Option<String> {
         self.score_all(client, need_ipv6)
             .into_iter()

@@ -16,9 +16,12 @@ pub struct GeoIpReader {
 #[derive(Debug, Clone, Default)]
 pub struct ClientLocation {
     pub country: Option<String>,
-    pub continent: Option<String>,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
+    /// Continent code (e.g. "EU", "AS"). Retained for Phase 2 scoring
+    /// where continent-level routing may be more stable than country.
+    #[allow(dead_code)]
+    pub continent: Option<String>,
 }
 
 impl GeoIpReader {

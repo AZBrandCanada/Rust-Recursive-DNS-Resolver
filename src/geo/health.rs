@@ -37,6 +37,9 @@ impl HealthState {
         }
     }
 
+    /// String form for structured logging and metrics. Retained as
+    /// stable API; the current call sites use `{:?}` for brevity.
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Healthy => "healthy",
@@ -85,10 +88,16 @@ impl NodeHealth {
         }
     }
 
+    /// Unix timestamp of the last successful health probe. Retained
+    /// for the per-node section of the /metrics endpoint (Phase 2).
+    #[allow(dead_code)]
     pub fn last_check_at(&self) -> u64 {
         self.last_check_at.load(Ordering::Relaxed)
     }
 
+    /// Full snapshot of health state for the /metrics endpoint.
+    /// Returns (state, total_success, total_failure, last_rtt_ms).
+    #[allow(dead_code)]
     pub fn snapshot(&self) -> (HealthState, u64, u64, Option<f64>) {
         (
             self.current(),
@@ -163,20 +172,26 @@ const HEALTH_QUERY: &[u8] = &[
 async fn check_node(node: &GeoNode, rtt_budget: Duration) -> Option<Duration> {
     let addr: SocketAddr = if let Some(v4) = node.ipv4 {
         SocketAddr::new(std::net::IpAddr::V4(v4), 53)
-    } else if let Some(v6) = node.ipv6 {
-        SocketAddr::new(std::net::IpAddr::V6(v6), 53)
     } else {
-        return None;
+        let v6 = node.ipv6?;
+        SocketAddr::new(std::net::IpAddr::V6(v6), 53)
     };
 
-    let bind = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let bind = if addr.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
     let socket = UdpSocket::bind(bind).await.ok()?;
     socket.connect(addr).await.ok()?;
 
     let start = std::time::Instant::now();
     socket.send(HEALTH_QUERY).await.ok()?;
     let mut buf = [0u8; 512];
-    let _n = timeout(rtt_budget, socket.recv(&mut buf)).await.ok()?.ok()?;
+    let _n = timeout(rtt_budget, socket.recv(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
     Some(start.elapsed())
 }
 

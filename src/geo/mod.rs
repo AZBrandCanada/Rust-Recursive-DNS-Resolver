@@ -16,9 +16,9 @@ pub mod geoip;
 pub mod health;
 pub mod router;
 
-pub use config::{GeoConfig, GeoNode};
-pub use geoip::{ClientLocation, GeoIpReader};
-pub use health::{HealthRegistry, HealthState, NodeHealth};
+pub use config::GeoConfig;
+pub use geoip::GeoIpReader;
+pub use health::HealthRegistry;
 pub use router::GeoRouter;
 
 use hickory_proto::rr::Name;
