@@ -28,7 +28,10 @@ pub fn build_doh_router(state: AppState) -> Router {
         )
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
-        .route("/internal/peer-heartbeat", axum::routing::post(handle_peer_heartbeat))
+        .route(
+            "/internal/peer-heartbeat",
+            axum::routing::post(handle_peer_heartbeat),
+        )
         .layer(DefaultBodyLimit::max(MAX_DOH_PAYLOAD))
         .with_state(state)
 }
@@ -252,7 +255,10 @@ async fn handle_peer_heartbeat(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let sig = match headers.get("x-peer-signature").and_then(|v| v.to_str().ok()) {
+    let sig = match headers
+        .get("x-peer-signature")
+        .and_then(|v| v.to_str().ok())
+    {
         Some(s) => s.to_string(),
         None => return StatusCode::UNAUTHORIZED.into_response(),
     };

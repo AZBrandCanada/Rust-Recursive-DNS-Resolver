@@ -11,10 +11,10 @@
 // src/geo/mesh.rs, not here.
 
 pub mod authoritative;
-pub mod peer;
 pub mod config;
 pub mod geoip;
 pub mod health;
+pub mod peer;
 pub mod router;
 
 pub use config::GeoConfig;
@@ -52,8 +52,7 @@ impl GeoState {
             }
         });
 
-        let peer_mesh_enabled =
-            config.self_node.is_some() && !config.peer_secret.is_empty();
+        let peer_mesh_enabled = config.self_node.is_some() && !config.peer_secret.is_empty();
         let health = Arc::new(HealthRegistry::new(&config.nodes));
         let router = GeoRouter::new(
             &config.nodes,

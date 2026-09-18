@@ -28,7 +28,6 @@ use super::health::HealthRegistry;
 use crate::cache::now_secs;
 use ring::hmac;
 use serde::{Deserialize, Serialize};
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -96,9 +95,7 @@ pub async fn run_heartbeat_loop(
     allow_insecure_tls: bool,
 ) {
     if secret.is_empty() || targets.is_empty() {
-        tracing::info!(
-            "[PEER] mesh disabled (secret or targets missing)"
-        );
+        tracing::info!("[PEER] mesh disabled (secret or targets missing)");
         return;
     }
 
@@ -145,7 +142,10 @@ pub async fn run_heartbeat_loop(
         let signature = sign(&secret, &body);
 
         for target in &targets {
-            let url = format!("{}/internal/peer-heartbeat", target.base_url.trim_end_matches('/'));
+            let url = format!(
+                "{}/internal/peer-heartbeat",
+                target.base_url.trim_end_matches('/')
+            );
             let client = client.clone();
             let body = body.clone();
             let sig = signature.clone();

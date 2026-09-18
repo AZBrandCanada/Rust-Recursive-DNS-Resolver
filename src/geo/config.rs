@@ -129,16 +129,13 @@ impl GeoConfig {
                     Vec::new()
                 }
                 None => {
-                    tracing::warn!(
-                        "[GEO] GEO_PEER_SECRET is not valid hex; peer mesh disabled"
-                    );
+                    tracing::warn!("[GEO] GEO_PEER_SECRET is not valid hex; peer mesh disabled");
                     Vec::new()
                 }
             }
         };
 
-        let peer_heartbeat_interval_secs =
-            env_u64("GEO_PEER_HEARTBEAT_INTERVAL", 10).max(2);
+        let peer_heartbeat_interval_secs = env_u64("GEO_PEER_HEARTBEAT_INTERVAL", 10).max(2);
 
         // Allowed IPs: every NODE<N>_IPV4 and NODE<N>_IPV6, plus any
         // explicit extras.

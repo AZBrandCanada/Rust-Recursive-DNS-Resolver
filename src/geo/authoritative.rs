@@ -155,11 +155,7 @@ pub fn answer(
         RecordType::A => {
             for node in &selected {
                 if let Some(v4) = node.ipv4 {
-                    resp.add_answer(Record::from_rdata(
-                        qname.clone(),
-                        ttl,
-                        RData::A(A(v4)),
-                    ));
+                    resp.add_answer(Record::from_rdata(qname.clone(), ttl, RData::A(A(v4))));
                 }
             }
         }
@@ -221,9 +217,8 @@ fn build_nodata(req_msg: &Message, qname: &Name, client_dnssec_ok: bool) -> Proc
     let _ = qname;
     match resp.to_bytes() {
         Ok(wire) => ProcessOutcome::Success(wire),
-        Err(_) => ProcessOutcome::ServFail(make_servfail_wire(
-            req_msg.id(),
-            req_msg.queries().first(),
-        )),
+        Err(_) => {
+            ProcessOutcome::ServFail(make_servfail_wire(req_msg.id(), req_msg.queries().first()))
+        }
     }
 }

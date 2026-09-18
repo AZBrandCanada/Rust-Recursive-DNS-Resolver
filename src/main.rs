@@ -83,14 +83,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 } else {
                     let secret = geo_config.peer_secret.clone();
-                    let interval = std::time::Duration::from_secs(
-                        geo_config.peer_heartbeat_interval_secs,
-                    );
+                    let interval =
+                        std::time::Duration::from_secs(geo_config.peer_heartbeat_interval_secs);
                     let registry = state.health.clone();
-                    let allow_insecure_tls = std::env::var("PEER_INSECURE_TLS")
-                        .ok()
-                        .as_deref()
-                        == Some("1");
+                    let allow_insecure_tls =
+                        std::env::var("PEER_INSECURE_TLS").ok().as_deref() == Some("1");
 
                     tokio::spawn(async move {
                         geo::peer::run_heartbeat_loop(
@@ -105,14 +102,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
                 }
             } else {
-                tracing::info!(
-                    "[PEER] GEO_PEER_SECRET not set; peer mesh disabled"
-                );
+                tracing::info!("[PEER] GEO_PEER_SECRET not set; peer mesh disabled");
             }
         } else {
-            tracing::info!(
-                "[PEER] GEO_SELF_NODE not set; peer mesh disabled"
-            );
+            tracing::info!("[PEER] GEO_SELF_NODE not set; peer mesh disabled");
         }
 
         Some(state)
