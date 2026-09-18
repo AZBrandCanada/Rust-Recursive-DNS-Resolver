@@ -107,8 +107,8 @@ unified-dns --version 2>/dev/null || echo "no --version flag; run with a config 
 ## Build from Source
 
 ```bash
-git clone https://github.com/AZBrandCanada/Rust-Recursive-DNS-Resolver.git
-cd Rust-Recursive-DNS-Resolver
+git clone https://github.com/AZBrandCanada/Unified-DNS.git
+cd Unified-DNS
 cargo build --release
 ```
 
