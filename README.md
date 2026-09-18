@@ -6,12 +6,276 @@ The server provides standard DNS over **UDP/TCP**, **DNS-over-TLS (DoT)**, **DNS
 
 The resolver combines a client-independent canonical cache with full DNSSEC validation, authenticated positive and negative responses, DNSKEY/DS trust chains, NSEC/NSEC3 denial proofs, CNAME/DNAME processing, RFC 1982 DNSSEC time arithmetic, ML-DSA-44 DNSSEC verification, stale-answer handling, rate limiting, anti-amplification defenses, and SSRF-resistant iterative resolution.
 
-Optionally, the same process can act as a small authoritative nameserver for a configured set of GSLB names (e.g. `dns.example.com`) and return region-appropriate backend addresses to each client. This is described in **Geo-Aware DNS Steering** below.
+Optionally, the same process can act as a small authoritative nameserver for a configured set of GSLB names (e.g. `dns.example.com`) and return region-appropriate backend addresses to each client. Multiple nodes coordinate via a small signed heartbeat mesh so that a failed node is excluded from GSLB answers within seconds.
+
 ![Unified DNS Banner](Photo/DNS.jpeg)
 
 ---
 
-## Architecture
+## Table of Contents
+
+- [Installation](#installation)
+  - [Prerequisites](#prerequisites)
+  - [Quick Install with cargo](#quick-install-with-cargo)
+  - [Build from Source](#build-from-source)
+  - [Linux System Installation](#linux-system-installation)
+  - [TLS Certificates](#tls-certificates)
+  - [Optional Data Files](#optional-data-files)
+- [Architecture](#architecture)
+  - [Canonical Cache Model](#canonical-cache-model)
+  - [Cache Layer Overview](#cache-layer-overview)
+- [Features](#features)
+  - [Multi-Protocol Transport](#multi-protocol-transport)
+  - [Bounded Concurrency](#bounded-concurrency)
+- [Iterative Recursive Resolution](#iterative-recursive-resolution)
+- [DNSSEC Validation](#dnssec-validation)
+- [Post-Quantum DNSSEC](#post-quantum-dnssec)
+- [Cryptographic Verification Backends](#cryptographic-verification-backends)
+- [Cryptographic Resource Limits](#cryptographic-resource-limits)
+- [Caching Engine](#caching-engine)
+- [Geo-Aware DNS Steering (GSLB)](#geo-aware-dns-steering-gslb)
+  - [Placement in the Request Path](#placement-in-the-request-path)
+  - [Node Configuration](#node-configuration)
+  - [Client Location Determination](#client-location-determination)
+  - [Selection Algorithm](#selection-algorithm)
+  - [Local Health Checking](#local-health-checking)
+  - [Peer Mesh (Cross-Node Health)](#peer-mesh-cross-node-health)
+  - [Multi-IP Failover](#multi-ip-failover)
+  - [Delegating a GSLB Name](#delegating-a-gslb-name)
+- [Root Zone Lifecycle](#root-zone-lifecycle)
+- [Operational Monitoring](#operational-monitoring)
+- [Resolver Hardening](#resolver-hardening)
+- [Rate Limiting and Abuse Protection](#rate-limiting-and-abuse-protection)
+- [Environment Variables](#environment-variables)
+- [Building](#building)
+- [Deployment](#deployment)
+- [Verification](#verification)
+- [Security Model](#security-model)
+- [Design Principles](#design-principles)
+- [License](#license)
+
+---
+
+# Installation
+
+## Prerequisites
+
+**Rust toolchain** — Rust 1.75 or newer. Install via [rustup](https://rustup.rs/):
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+rustc --version
+```
+
+**Linux build dependencies** — the resolver needs a C toolchain and standard headers for the crypto backends (`ring`, `ml-dsa`). On common distributions:
+
+```bash
+# Debian / Ubuntu
+sudo apt update
+sudo apt install -y build-essential pkg-config libssl-dev
+
+# Fedora / RHEL / AlmaLinux
+sudo dnf install -y gcc gcc-c++ make pkg-config openssl-devel
+
+# Arch / CachyOS / Manjaro
+sudo pacman -S --needed base-devel pkgconf openssl
+```
+
+**Runtime ports** — the resolver binds privileged ports by default (53, 853, 443). Either run as root, grant `CAP_NET_BIND_SERVICE`, or use the built-in unprivileged fallback ports (5053, 8853, 8443).
+
+```bash
+sudo setcap 'cap_net_bind_service=+ep' /path/to/unified-dns
+```
+
+## Quick Install with cargo
+
+If you only want the binary and do not need to modify the code:
+
+```bash
+cargo install --git https://github.com/AZBrandCanada/Rust-Recursive-DNS-Resolver
+```
+
+The binary is installed to `~/.cargo/bin/unified-dns`.
+
+Verify:
+
+```bash
+unified-dns --version 2>/dev/null || echo "no --version flag; run with a config to start"
+```
+
+## Build from Source
+
+```bash
+git clone https://github.com/AZBrandCanada/Rust-Recursive-DNS-Resolver.git
+cd Rust-Recursive-DNS-Resolver
+cargo build --release
+```
+
+The resulting binary is `./target/release/unified-dns`.
+
+For a faster development loop:
+
+```bash
+cargo run --release
+```
+
+## Linux System Installation
+
+The recommended production layout:
+
+```
+/opt/unified-dns/           # working directory
+├── unified-dns             # binary
+├── cache.json              # persisted cache (created on first run)
+├── root.zone               # IANA root zone (optional)
+├── root_zone.json          # parsed root zone cache
+├── GeoLite2-City.mmdb      # MaxMind database (only if GSLB enabled)
+├── tranco_list.txt         # pre-warm list (optional)
+└── certs/
+    ├── fullchain.pem
+    └── privkey.pem
+```
+
+**1. Create the service user and directory**
+
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin unified-dns
+sudo mkdir -p /opt/unified-dns
+sudo chown unified-dns:unified-dns /opt/unified-dns
+```
+
+**2. Install the binary**
+
+```bash
+sudo install -o unified-dns -g unified-dns -m 0755 \
+    target/release/unified-dns /opt/unified-dns/unified-dns
+```
+
+**3. Install the systemd unit**
+
+Save the following as `/etc/systemd/system/unified-dns.service` (adjust the paths to match your environment):
+
+```ini
+[Unit]
+Description=Unified Recursive DNS Server
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=unified-dns
+Group=unified-dns
+WorkingDirectory=/opt/unified-dns
+ExecStart=/opt/unified-dns/unified-dns
+
+# Listener configuration
+Environment="HOST=0.0.0.0"
+Environment="DNS_PORT=53"
+Environment="DOT_PORT=853"
+Environment="DOQ_PORT=853"
+Environment="DOH_PORT=443"
+Environment="DOH3_PORT=443"
+Environment="DOH_NO_TLS=0"
+
+# DNSSEC enforcement
+Environment="DNSSEC_ENFORCE=1"
+
+# Rate limits and stale serving
+Environment="MAX_STALE_SECS=300"
+Environment="RATE_LIMIT_BURST=300"
+Environment="RATE_LIMIT_PER_SEC=60"
+
+# TLS
+Environment="CERT_PATH=/opt/unified-dns/certs/fullchain.pem"
+Environment="KEY_PATH=/opt/unified-dns/certs/privkey.pem"
+
+# Cache (relative paths resolve against WorkingDirectory)
+Environment="CACHE_FILE=cache.json"
+Environment="CACHE_MAX_ENTRIES=500000"
+Environment="CACHE_PREFETCH=1"
+
+# Root zone (relative paths resolve against WorkingDirectory)
+#Environment="ROOT_ZONE_FILE=root.zone"
+#Environment="ROOT_ZONE_REFRESH_HOURS=168"
+
+# Logging
+Environment="RUST_LOG=info,unified_dns=info"
+
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**4. Grant the capability and start**
+
+```bash
+sudo setcap 'cap_net_bind_service=+ep' /opt/unified-dns/unified-dns
+sudo systemctl daemon-reload
+sudo systemctl enable --now unified-dns.service
+sudo systemctl status unified-dns --no-pager
+```
+
+**5. Verify**
+
+```bash
+dig @127.0.0.1 -p 53 cloudflare.com A +dnssec
+```
+
+You should see `NOERROR` with the `ad` flag.
+
+## TLS Certificates
+
+DoT, DoQ, DoH, and DoH3 all require a certificate whose Subject Alternative Names match the hostname clients will connect to. For a single wildcard that covers everything under one domain:
+
+```bash
+sudo apt install -y certbot  # or use acme.sh / your preferred ACME client
+sudo certbot certonly --dns-cloudflare \
+    -d example.com -d '*.example.com' \
+    --dns-cloudflare-credentials /etc/letsencrypt/cloudflare.ini
+```
+
+Then copy or symlink `fullchain.pem` and `privkey.pem` into `/opt/unified-dns/certs/`.
+
+If you are using acme.sh, add a `--reloadcmd` so the resolver reloads the cert on renewal:
+
+```bash
+acme.sh --install-cert -d example.com -d '*.example.com' --ecc \
+    --fullchain-file /opt/unified-dns/certs/fullchain.pem \
+    --key-file /opt/unified-dns/certs/privkey.pem \
+    --reloadcmd "systemctl restart unified-dns"
+```
+
+If no certificate is configured, the resolver generates a self-signed development certificate on first start. This is fine for testing but will not be trusted by real clients.
+
+## Optional Data Files
+
+**Root zone (recommended).** Pre-populates the delegation cache with all TLD delegations so the first query for a `.com` domain goes directly to the `.com` servers instead of the root servers.
+
+```bash
+sudo -u unified-dns curl -sS -o /opt/unified-dns/root.zone \
+    https://www.internic.net/domain/root.zone
+```
+
+The resolver parses it on first start and refreshes it weekly in-process.
+
+**MaxMind GeoLite2-City (only if GSLB is enabled).** Provides country and latitude/longitude lookups for GSLB steering. Free account required at https://www.maxmind.com/en/geolite2/signup.
+
+```bash
+# After downloading GeoLite2-City_YYYYMMDD.tar.gz
+tar -xzf GeoLite2-City_*.tar.gz
+sudo cp GeoLite2-City_*/GeoLite2-City.mmdb /opt/unified-dns/
+sudo chown unified-dns:unified-dns /opt/unified-dns/GeoLite2-City.mmdb
+```
+
+**Tranco list (optional, for pre-warming).** The resolver can pre-warm its cache from the Tranco Top 1M list on startup. It downloads the list automatically if `WARM_LIMIT` is set and the file is not present.
+
+---
+
+# Architecture
 
 All inbound transports share a single resolution pipeline. Transport-specific protocol handling occurs at the edge; recursive resolution, DNSSEC validation, caching, and client response construction are centralized.
 
@@ -62,7 +326,7 @@ When GSLB is enabled, a second major architectural property is that **authoritat
        • per-request        • Fresh / Stale / Expired
        • GeoIP + ECS        • Bounded by moka W-TinyLFU
        • health scoring            │
-       • single A/AAAA     MISS ───┴─── HIT
+       • single or multi   MISS ───┴─── HIT
        • never cached              │
                  │                 ▼
                  │       Single-Flight Gate
@@ -102,7 +366,7 @@ When GSLB is enabled, a second major architectural property is that **authoritat
                           Final DNS Response
 ```
 
-### Canonical Cache Model
+## Canonical Cache Model
 
 Each cache entry contains:
 
@@ -112,11 +376,9 @@ Each cache entry contains:
 * Explicit `DnssecStatus`
 * Positive / Negative classification
 
-Client-specific properties are generated only when serving the response.
+Client-specific properties are generated only when serving the response. This avoids maintaining separate DO=0 and DO=1 caches and prevents one client's DNS flags from leaking into another client's response.
 
-This avoids maintaining separate DO=0 and DO=1 caches and prevents one client's DNS flags from leaking into another client's response.
-
-### Cache Layer Overview
+## Cache Layer Overview
 
 The resolver maintains several logically separate caches, each with its own lifecycle and trust model:
 
@@ -183,7 +445,8 @@ HTTP request validation distinguishes protocol errors from DNS resolution errors
 The DoH router also exposes operational endpoints:
 
 * `GET /health` — lightweight liveness probe
-* `GET /metrics` — JSON snapshot of cache, single-flight, prefetch, and root zone state
+* `GET /metrics` — JSON snapshot of cache, single-flight, prefetch, root zone, and GSLB state
+* `POST /internal/peer-heartbeat` — authenticated inter-node health mesh receiver (see [Peer Mesh](#peer-mesh-cross-node-health))
 
 ### RFC 9114 / RFC 9000 DoH3 (DNS-over-HTTP/3)
 
@@ -194,7 +457,7 @@ The server implements native HTTP/3 transport over QUIC:
 * Supports 0-RTT session resumption and connection migration across client network transitions
 * Advertises HTTP/3 availability via `Alt-Svc: h3=":443"; ma=86400`
 * Shares the exact same request validation, canonical caching, and DNSSEC pipeline as DoH
-* Serves `/dns-query`, `/health`, and `/metrics`
+* Serves `/dns-query`, `/health`, `/metrics`, and `/internal/peer-heartbeat`
 
 ### DNS TCP and DoT Framing
 
@@ -220,19 +483,11 @@ The resolver separately enforces an operational **4,096-byte maximum inbound UDP
 
 ### Reverse-Proxy Mode
 
-DoH can operate without local TLS using:
-
-```text
-DOH_NO_TLS=1
-```
-
-This allows Nginx, Caddy, Envoy, or another reverse proxy to terminate HTTPS/H3 while forwarding HTTP traffic to the resolver backend.
+DoH can operate without local TLS using `DOH_NO_TLS=1`. This allows Nginx, Caddy, Envoy, or another reverse proxy to terminate HTTPS/H3 while forwarding HTTP traffic to the resolver backend.
 
 ### Development Certificates
 
-When configured TLS certificate files are unavailable, the server can generate a self-signed development certificate automatically.
-
-On Unix systems, generated private keys are protected with restrictive `0600` permissions.
+When configured TLS certificate files are unavailable, the server can generate a self-signed development certificate automatically. On Unix systems, generated private keys are protected with restrictive `0600` permissions.
 
 ### Unprivileged Port Fallback
 
@@ -246,7 +501,7 @@ When privileged ports cannot be bound (e.g., running without root or `CAP_NET_BI
 | DoH     |    TCP    |             443 |          8443 | `DOH_PORT`           |
 | DoH3    |    UDP    |             443 |          8443 | `DOH3_PORT`          |
 
-### Bounded Concurrency
+## Bounded Concurrency
 
 Tokio semaphores limit concurrent work to reduce resource exhaustion:
 
@@ -327,9 +582,7 @@ IPv4 prioritization reduces failures on systems without functional IPv6 routing 
 
 ## CNAME Chain Traversal
 
-When an authoritative response contains multiple CNAME hops, the resolver follows the chain directly within the response whenever possible.
-
-This avoids unnecessary network requests when the authoritative server has already supplied subsequent links in the chain.
+When an authoritative response contains multiple CNAME hops, the resolver follows the chain directly within the response whenever possible. This avoids unnecessary network requests when the authoritative server has already supplied subsequent links in the chain.
 
 ## DNAME Synthesis
 
@@ -345,14 +598,7 @@ When a DNAME redirects a queried name, the resolver:
 
 ## DNSSEC Material Preservation
 
-When CNAME or DNAME responses are merged across resolution stages, the resolver preserves the DNSSEC material required to validate each step, including relevant:
-
-* RRSIG
-* NSEC
-* NSEC3
-* DNSKEY
-
-records.
+When CNAME or DNAME responses are merged across resolution stages, the resolver preserves the DNSSEC material required to validate each step, including relevant RRSIG, NSEC, NSEC3, and DNSKEY records.
 
 This prevents response-merging logic from accidentally discarding cryptographic evidence needed by the validator.
 
@@ -366,24 +612,13 @@ Empty authoritative responses must contain meaningful terminal information such 
 
 Delegation responses are checked for coherent NS information and safe glue.
 
-Glue addresses are accepted directly only when they satisfy the resolver's bailiwick requirements.
-
-Out-of-bailiwick nameserver addresses are resolved independently rather than trusted as arbitrary address hints.
+Glue addresses are accepted directly only when they satisfy the resolver's bailiwick requirements. Out-of-bailiwick nameserver addresses are resolved independently rather than trusted as arbitrary address hints.
 
 This mitigates cache poisoning attacks involving forged or out-of-bailiwick glue.
 
 ## Upstream Response Failover
 
-Authoritative nameservers are treated independently.
-
-Transient or unusable responses such as:
-
-* `SERVFAIL`
-* `REFUSED`
-* `FORMERR`
-* `NOTIMP`
-
-can cause the resolver to fail over to other nameserver candidates rather than immediately abandoning the resolution.
+Authoritative nameservers are treated independently. Transient or unusable responses such as `SERVFAIL`, `REFUSED`, `FORMERR`, or `NOTIMP` can cause the resolver to fail over to other nameserver candidates rather than immediately abandoning the resolution.
 
 ## EDNS Compatibility Fallback
 
@@ -399,16 +634,7 @@ TCP connection, write, length-read, and payload-read operations are collectively
 
 ## Upstream DNSSEC Queries
 
-Iterative upstream queries are issued with:
-
-```text
-RD=0
-CD=1
-```
-
-The resolver performs DNSSEC validation itself rather than requesting upstream recursive validation.
-
-Setting `CD=1` prevents an upstream validating resolver from interfering with the resolver's own validation decisions.
+Iterative upstream queries are issued with `RD=0` and `CD=1`. The resolver performs DNSSEC validation itself rather than requesting upstream recursive validation. Setting `CD=1` prevents an upstream validating resolver from interfering with the resolver's own validation decisions.
 
 ## Recursion Bounds
 
@@ -422,9 +648,7 @@ Cycle detection prevents repeated traversal of the same resolution state.
 
 ## Parent-Zone DS Resolution
 
-DS records are queried from the **parent zone**, not from the child zone.
-
-This follows the DNSSEC delegation model and prevents a child from being treated as authoritative for its own delegation proof.
+DS records are queried from the **parent zone**, not from the child zone. This follows the DNSSEC delegation model and prevents a child from being treated as authoritative for its own delegation proof.
 
 ---
 
@@ -462,21 +686,7 @@ The resolver includes the current root trust anchors:
 
 Root and intermediate authentication failures are treated as validation failures.
 
-With:
-
-```text
-DNSSEC_ENFORCE=1
-```
-
-broken DNSSEC validation results in `SERVFAIL`.
-
-With:
-
-```text
-DNSSEC_ENFORCE=0
-```
-
-validation failures do not produce an authenticated (`AD=1`) response.
+With `DNSSEC_ENFORCE=1`, broken DNSSEC validation results in `SERVFAIL`. With `DNSSEC_ENFORCE=0`, validation failures do not produce an authenticated (`AD=1`) response.
 
 > Root trust anchors are embedded in the resolver and must be updated when the IANA DNSSEC root trust-anchor set changes.
 
@@ -506,28 +716,15 @@ For each signed delegation it:
 5. Validates the DNSKEY RRset
 6. Uses authenticated zone keys to validate subsequent RRsets
 
-Authenticated child DNSKEY cache lifetime is bounded by:
-
-```text
-min(child DNSKEY TTL, parent DS TTL)
-```
-
-This prevents an authenticated DNSKEY from remaining trusted longer than the delegation information that authenticated it.
+Authenticated child DNSKEY cache lifetime is bounded by `min(child DNSKEY TTL, parent DS TTL)`. This prevents an authenticated DNSKEY from remaining trusted longer than the delegation information that authenticated it.
 
 ## KSK/ZSK Trust Model
 
-The validator distinguishes between:
-
-* Keys used to authenticate the DNSKEY RRset
-* Zone keys used to authenticate ordinary zone data
-
-The DNSKEY `Zone Key` flag is enforced when selecting keys for ordinary RRset validation.
+The validator distinguishes between keys used to authenticate the DNSKEY RRset and zone keys used to authenticate ordinary zone data. The DNSKEY `Zone Key` flag is enforced when selecting keys for ordinary RRset validation.
 
 ## RRSIG Time Validation
 
-DNSSEC signature inception and expiration timestamps are treated as 32-bit DNS serial numbers.
-
-RFC 1982 serial-number arithmetic is used instead of naive integer comparison, including across the DNSSEC timestamp rollover boundary.
+DNSSEC signature inception and expiration timestamps are treated as 32-bit DNS serial numbers. RFC 1982 serial-number arithmetic is used instead of naive integer comparison, including across the DNSSEC timestamp rollover boundary.
 
 ## Canonical DNSSEC Serialization
 
@@ -543,13 +740,7 @@ Names with embedded escape sequences (such as SOA `rname` fields containing esca
 
 Negative responses are validated cryptographically rather than trusting `NXDOMAIN` or empty answers by themselves.
 
-The validator supports:
-
-* NODATA
-* NXDOMAIN
-* Wildcard NODATA
-* Wildcard NXDOMAIN
-* Authenticated DS nonexistence
+The validator supports NODATA, NXDOMAIN, wildcard NODATA, wildcard NXDOMAIN, and authenticated DS nonexistence.
 
 ### Authenticated SOA
 
@@ -557,43 +748,25 @@ For authoritative negative responses, the SOA RRset is validated against the zon
 
 ### NSEC
 
-NSEC validation verifies the appropriate denial relationships, including:
-
-* Exact-name existence
-* Type bitmap absence
-* Wildcard conditions
-* NXDOMAIN coverage
+NSEC validation verifies the appropriate denial relationships, including exact-name existence, type bitmap absence, wildcard conditions, and NXDOMAIN coverage.
 
 ### NSEC3
 
-NSEC3 validation implements the closest-provable-encloser model and validates:
-
-* NSEC3 hash ordering
-* Closest encloser
-* Next-closer coverage
-* Wildcard denial
-* NODATA conditions
-* NXDOMAIN conditions
+NSEC3 validation implements the closest-provable-encloser model and validates NSEC3 hash ordering, closest encloser, next-closer coverage, wildcard denial, NODATA conditions, and NXDOMAIN conditions.
 
 ### NSEC3 Opt-Out
 
-Opt-Out records are treated conservatively.
-
-An Opt-Out proof can establish an insecure delegation for an appropriate **DS query**, but it is not accepted as generic proof that arbitrary records do not exist inside a signed zone.
+Opt-Out records are treated conservatively. An Opt-Out proof can establish an insecure delegation for an appropriate **DS query**, but it is not accepted as generic proof that arbitrary records do not exist inside a signed zone.
 
 When an opt-out NSEC3 covers the next-closer name for a non-DS query, the response is treated as Insecure rather than Secure, and `AD` is not set.
 
 ### NSEC3 Iteration Limits
 
-NSEC3 records exceeding the configured safe iteration threshold are rejected rather than processed indefinitely.
-
-The implementation follows the operational guidance of RFC 9276 and rejects NSEC3 records advertising more than 150 iterations.
+NSEC3 records exceeding the configured safe iteration threshold are rejected rather than processed indefinitely. The implementation follows the operational guidance of RFC 9276 and rejects NSEC3 records advertising more than 150 iterations.
 
 ## DS Nonexistence Downgrade Protection
 
-An empty DS response is not automatically interpreted as proof that a delegation is insecure.
-
-The resolver requires authenticated parent-zone denial evidence before treating DS nonexistence as an insecure delegation.
+An empty DS response is not automatically interpreted as proof that a delegation is insecure. The resolver requires authenticated parent-zone denial evidence before treating DS nonexistence as an insecure delegation.
 
 This prevents unauthenticated DS omission from being interpreted as a legitimate downgrade from DNSSEC validation.
 
@@ -603,16 +776,9 @@ This prevents unauthenticated DS omission from being interpreted as a legitimate
 
 The resolver supports **ML-DSA-44 / DNSSEC Algorithm 18** in addition to conventional DNSSEC algorithms.
 
-ML-DSA-44 verification is implemented through the RustCrypto `ml-dsa` backend rather than relying exclusively on protocol-library support.
+ML-DSA-44 verification is implemented through the RustCrypto `ml-dsa` backend rather than relying exclusively on protocol-library support. The implementation follows NIST FIPS 204 and DNSSEC Algorithm 18 specifications.
 
-The implementation follows:
-
-* NIST FIPS 204
-* DNSSEC Algorithm 18 specifications
-
-ML-DSA-44 signatures and public keys are substantially larger than conventional DNSSEC signatures, so Algorithm 18 responses frequently exceed the 1,232-byte EDNS payload target.
-
-The resolver automatically falls back to TCP when an authoritative server truncates such responses.
+ML-DSA-44 signatures and public keys are substantially larger than conventional DNSSEC signatures, so Algorithm 18 responses frequently exceed the 1,232-byte EDNS payload target. The resolver automatically falls back to TCP when an authoritative server truncates such responses.
 
 ---
 
@@ -622,15 +788,7 @@ The DNSSEC engine uses multiple verification backends.
 
 ### Classical Cryptography
 
-The optimized `ring` backend handles supported:
-
-* RSA/SHA-256
-* RSA/SHA-512
-* ECDSA P-256/SHA-256
-* ECDSA P-384/SHA-384
-* Ed25519
-
-RSA keys are bounded to the supported 2,048–8,192-bit range.
+The optimized `ring` backend handles supported RSA/SHA-256, RSA/SHA-512, ECDSA P-256/SHA-256, ECDSA P-384/SHA-384, and Ed25519. RSA keys are bounded to the supported 2,048–8,192-bit range.
 
 ### Legacy RSA/SHA-1
 
@@ -640,10 +798,7 @@ These zones frequently publish 1,024-bit RSA ZSKs, which fall below the `ring` b
 
 ### Post-Quantum Cryptography
 
-The RustCrypto `ml-dsa` backend handles:
-
-* ML-DSA-44
-* DNSSEC Algorithm 18
+The RustCrypto `ml-dsa` backend handles ML-DSA-44 and DNSSEC Algorithm 18.
 
 ### Native Protocol Fallback
 
@@ -653,22 +808,13 @@ Remaining supported DNSSEC algorithms are delegated to the native `hickory-proto
 
 # Cryptographic Resource Limits
 
-DNSSEC validation is subject to a per-query cryptographic work budget.
+DNSSEC validation is subject to a per-query cryptographic work budget:
 
 ```text
 PER_VALIDATION_MAX_SIG_CHECKS = 24
 ```
 
-The same validation budget is carried across the validation process rather than independently resetting for each stage.
-
-The budget applies across:
-
-* Positive RRset validation
-* Negative proof validation
-* DS validation
-* DNSKEY validation
-* DNSKEY self-signatures
-* Other signature verification stages
+The same validation budget is carried across the validation process rather than independently resetting for each stage. The budget applies across positive RRset validation, negative proof validation, DS validation, DNSKEY validation, DNSKEY self-signatures, and other signature verification stages.
 
 This limits algorithmic CPU consumption from deliberately complex DNSSEC responses and mitigates KeyTrap-style denial-of-service attacks.
 
@@ -678,23 +824,7 @@ This limits algorithmic CPU consumption from deliberately complex DNSSEC respons
 
 The cache is designed around canonical DNS state rather than client-specific DNS responses.
 
-Cache keys are:
-
-```text
-{qname}:{qtype}:IN
-```
-
-Each cache entry contains:
-
-```text
-Canonical DNS response
-Effective TTL
-Cache timestamps
-DnssecStatus
-EntryKind (Positive or Negative)
-```
-
-There is no separate DO=0/DO=1 cache.
+Cache keys are `{qname}:{qtype}:IN`. Each cache entry contains the canonical DNS response, effective TTL, cache timestamps, `DnssecStatus`, and an `EntryKind` classification (Positive or Negative). There is no separate DO=0/DO=1 cache.
 
 ## Bounded Capacity and Eviction
 
@@ -731,19 +861,13 @@ Failed prefetches are subject to exponential backoff. A failed prefetch never in
 
 ## DNSSEC-Aware Effective TTL
 
-For `Secure` data, the effective cache lifetime is bounded by the remaining validity of the RRSIGs required to authenticate the cached data.
-
-Conceptually:
+For `Secure` data, the effective cache lifetime is bounded by the remaining validity of the RRSIGs required to authenticate the cached data:
 
 ```text
-effective_ttl =
-    min(normal_min_ttl,
-        remaining_required_rrsig_validity)
+effective_ttl = min(normal_min_ttl, remaining_required_rrsig_validity)
 ```
 
-RRSIG expiration is calculated using RFC 1982 serial arithmetic.
-
-This ensures authenticated data cannot remain `Fresh` beyond the validity of the signatures authenticating it.
+RRSIG expiration is calculated using RFC 1982 serial arithmetic. This ensures authenticated data cannot remain `Fresh` beyond the validity of the signatures authenticating it.
 
 ## Dynamic TTL Aging
 
@@ -753,55 +877,21 @@ Cached DNS record TTLs are aged when responses are served:
 remaining_ttl = max(effective_ttl - age, 0)
 ```
 
-The cryptographic `Original TTL` contained inside RRSIG RDATA is never modified.
-
-EDNS OPT records are excluded from ordinary DNS TTL aging.
+The cryptographic `Original TTL` contained inside RRSIG RDATA is never modified. EDNS OPT records are excluded from ordinary DNS TTL aging.
 
 ## Cache Freshness
 
 Each cache entry has one of three runtime freshness states.
 
-### Fresh
+**Fresh** (`age < effective TTL`) — served immediately with dynamically aged record TTLs.
 
-```text
-age < effective TTL
-```
+**Stale** (`effective TTL <= age < effective TTL + MAX_STALE_SECS`) — served under RFC 8767 stale-answer handling. Stale responses receive a positive 30-second wire TTL and trigger asynchronous background revalidation. Stale DNSSEC responses always clear `AD=0`.
 
-The response is served immediately with dynamically aged record TTLs.
-
-### Stale
-
-```text
-effective TTL <= age < effective TTL + MAX_STALE_SECS
-```
-
-The response can be served under RFC 8767 stale-answer handling.
-
-Stale responses receive a positive **30-second wire TTL** and trigger asynchronous background revalidation.
-
-Stale DNSSEC responses always clear:
-
-```text
-AD=0
-```
-
-### Expired
-
-```text
-age >= effective TTL + MAX_STALE_SECS
-```
-
-The cached response is no longer served.
-
-The resolver performs synchronous recursive resolution instead.
-
-If resolution fails, the resolver returns `SERVFAIL` rather than resurrecting an expired response.
+**Expired** (`age >= effective TTL + MAX_STALE_SECS`) — the cached response is no longer served. The resolver performs synchronous recursive resolution instead. If resolution fails, the resolver returns `SERVFAIL` rather than resurrecting an expired response.
 
 ## Client-Specific Response Construction
 
-The canonical cache is converted into a client-specific DNS response only at request time.
-
-The response builder:
+The canonical cache is converted into a client-specific DNS response only at request time. The response builder:
 
 1. Ages client-visible TTLs
 2. Retrieves the stored DNSSEC security state
@@ -813,59 +903,31 @@ The response builder:
 8. Constructs the client EDNS response
 9. Applies response-size policy
 
-For a `Secure` response, `AD=1` requires:
-
-* Validated `DnssecStatus::Secure`
-* Fresh cache data
-* Appropriate client DNSSEC signaling
-* `CD=0`
-
-Stale responses never receive `AD=1`.
+For a `Secure` response, `AD=1` requires validated `DnssecStatus::Secure`, fresh cache data, appropriate client DNSSEC signaling, and `CD=0`. Stale responses never receive `AD=1`.
 
 ## Test Mode
 
-Caching can be disabled at runtime via:
-
-```text
-CACHE_ENABLED=0
-```
-
-When disabled:
-
-* Cache reads are skipped
-* Cache writes are skipped
-* Single-flight remains active, so concurrent identical misses still coalesce
-
-This allows behavioral comparison between "resolver with cache" and "resolver without cache" without changing the binary.
+Caching can be disabled at runtime via `CACHE_ENABLED=0`. When disabled, cache reads and writes are skipped, but single-flight remains active, so concurrent identical misses still coalesce. This allows behavioral comparison between "resolver with cache" and "resolver without cache" without changing the binary.
 
 ## Persistent Cache Hygiene
 
-Cache entries are persisted periodically and on clean shutdown.
+Cache entries are persisted periodically and on clean shutdown. Persistence uses an atomic temporary-file write followed by rename.
 
-Persistence uses an atomic temporary-file write followed by rename.
-
-At startup:
-
-* Entries missing explicit `dnssec_status` are discarded
-* Expired entries are discarded
-* Entries outside the allowable stale window are discarded
-* Valid entries are restored without assuming an unverified DNSSEC state
+At startup, entries missing explicit `dnssec_status` are discarded, expired entries are discarded, entries outside the allowable stale window are discarded, and valid entries are restored without assuming an unverified DNSSEC state.
 
 This deliberately avoids silently assigning a security state to legacy cache data.
 
 ## Tranco Pre-Warming
 
-Optional startup pre-warming can populate the cache using the Tranco Top 1M list.
-
-Pre-warmed responses pass through normal recursive resolution and DNSSEC validation.
-
-Secure responses use the same DNSSEC-aware effective TTL calculation as ordinary cache entries.
+Optional startup pre-warming can populate the cache using the Tranco Top 1M list. Pre-warmed responses pass through normal recursive resolution and DNSSEC validation. Secure responses use the same DNSSEC-aware effective TTL calculation as ordinary cache entries.
 
 ---
 
 # Geo-Aware DNS Steering (GSLB)
 
-The resolver can act as a small authoritative GSLB for a configured set of names (typically one per service endpoint, e.g. `dns.example.com`). When a query arrives for one of these names, the resolver selects a backend node based on the client's apparent location and the node's measured health, then returns a **single** A or AAAA record with that node's address.
+The resolver can act as a small authoritative GSLB for a configured set of names (typically one per service endpoint, e.g. `dns.example.com`). When a query arrives for one of these names, the resolver selects one or more backend nodes based on the client's apparent location and each node's measured health, then returns A or AAAA records for those nodes.
+
+This is useful when you run multiple geographically distributed resolver or service instances and want clients to reach the closest healthy one without paying for a commercial GSLB product.
 
 ## Placement in the Request Path
 
@@ -890,7 +952,7 @@ incoming query
   (per-request decision) (shared cache)
        │                     │
        ▼                     ▼
-  single A/AAAA         canonical response
+  A/AAAA response       canonical response
 ```
 
 This guarantees that per-client decisions never enter the shared recursive cache, and that two clients with different geographic origins can receive different answers for the same qname without either poisoning the other. The GSLB path is entirely separate from the recursive resolver: it does not use the delegation cache, the DNSSEC validator, or the answer cache.
@@ -905,10 +967,11 @@ Per-node variables use the form `NODE<N>_<FIELD>` where `<N>` starts at 1 and in
 
 | Field | Required | Description |
 | --- | --- | --- |
-| `NODE<N>_NAME` | yes | Unique node identifier, used in logs and metrics |
+| `NODE<N>_NAME` | yes | Unique node identifier, used in logs, metrics, and the peer mesh |
 | `NODE<N>_IPV4` | one of IPv4/IPv6 | IPv4 address returned to A queries |
 | `NODE<N>_IPV6` | one of IPv4/IPv6 | IPv6 address returned to AAAA queries |
-| `NODE<N>_LOCATION` | no | Human-readable region tag (informational only) |
+| `NODE<N>_DOH_URL` | required for peer mesh | Base URL of the node's DoH endpoint (no path). Used by the peer heartbeat sender |
+| `NODE<N>_LOCATION` | no | Human-readable region tag (informational) |
 | `NODE<N>_LAT` | recommended | Latitude for geographic scoring |
 | `NODE<N>_LON` | recommended | Longitude for geographic scoring |
 | `NODE<N>_ENABLED` | no (default `true`) | Set to `false` to disable a node without removing its configuration |
@@ -919,21 +982,24 @@ Example configuration for three nodes:
 
 ```ini
 Environment=NODE1_NAME=asia-1
-Environment=NODE1_IPV4=101.212.112.112
+Environment=NODE1_IPV4=203.0.113.10
+Environment=NODE1_DOH_URL=https://dns1.example.com
 Environment=NODE1_LOCATION=asia
 Environment=NODE1_LAT=1.3521
 Environment=NODE1_LON=103.8198
 Environment=NODE1_ENABLED=true
 
 Environment=NODE2_NAME=europe-1
-Environment=NODE2_IPV4=191.221.231.111
+Environment=NODE2_IPV4=198.51.100.20
+Environment=NODE2_DOH_URL=https://dns2.example.com
 Environment=NODE2_LOCATION=europe
 Environment=NODE2_LAT=52.5200
 Environment=NODE2_LON=13.4050
 Environment=NODE2_ENABLED=true
 
 Environment=NODE3_NAME=usa-1
-Environment=NODE3_IPV4=191.221.102.212
+Environment=NODE3_IPV4=192.0.2.30
+Environment=NODE3_DOH_URL=https://dns3.example.com
 Environment=NODE3_LOCATION=north_america
 Environment=NODE3_LAT=40.7128
 Environment=NODE3_LON=-74.0060
@@ -953,7 +1019,7 @@ The ECS subnet is masked to the advertised prefix length before being used, so f
 
 The GeoIP lookup uses a local MaxMind GeoLite2-City database (`GEOIP_DATABASE`, default `GeoLite2-City.mmdb` in the working directory). Only the country code and latitude/longitude are read from the database; no other fields are queried.
 
-If the GeoIP lookup fails (missing database, unknown IP, private address), the client is treated as "unknown location" and scoring degenerates to non-geographic inputs (health and any available latency). This does not cause an error; the request is served with whatever information is available.
+If the GeoIP lookup fails (missing database, unknown IP, private address), the client is treated as "unknown location" and scoring degenerates to non-geographic inputs (health and any available latency).
 
 ## Selection Algorithm
 
@@ -963,7 +1029,7 @@ Each eligible node receives a weighted score:
 score = 0.5 * geo_score + 0.3 * latency_score + 0.2 * health_score
 ```
 
-Where each component is in `[0.0, 1.0]`:
+Each component is in `[0.0, 1.0]`:
 
 | Component | 1.0 at | 0.5 at | Notes |
 | --- | --- | --- | --- |
@@ -971,11 +1037,11 @@ Where each component is in `[0.0, 1.0]`:
 | `latency_score` | 0 ms | 100 ms | Last successful health-check RTT |
 | `health_score` | healthy | degraded | Static per state |
 
-Unhealthy nodes are excluded entirely. Nodes missing geo or latency data receive a neutral `0.5` for that component, which makes the formula degrade gracefully to whichever components are available. On a cold start (no health data yet), the formula reduces to nearly pure geographic steering, which is the desired behavior.
+Unhealthy nodes are excluded entirely. Nodes missing geo or latency data receive a neutral `0.5` for that component, which makes the formula degrade gracefully to whichever components are available. On a cold start (no health data yet), the formula reduces to nearly pure geographic steering.
 
-The scores are computed per request and never cached. This keeps the decision fresh as client location or node health changes.
+The scores are computed per request and never cached.
 
-## Health Checking
+## Local Health Checking
 
 Every enabled node is probed independently on `GEO_HEALTH_INTERVAL` (default 30 seconds). The probe is a minimal UDP DNS query (`example.com A`) sent to the node's configured address on port 53. Success is measured as a valid DNS response within 3 seconds; the RTT is recorded and fed into the scoring formula.
 
@@ -993,66 +1059,177 @@ Health checks are bounded to a maximum of three concurrent probes. Only the node
 
 If a node has both IPv4 and IPv6 configured, only the IPv4 address is probed. IPv6-only nodes are probed over IPv6.
 
+## Peer Mesh (Cross-Node Health)
+
+Local health checks alone have two limitations: they take `GEO_HEALTH_INTERVAL` to detect a failure, and each node only knows what it can see directly. The peer mesh fixes both by having each node periodically push a small signed heartbeat to every other node.
+
+**Design goals:**
+
+* Detect a peer failure within ~3× the heartbeat interval (so 10s interval → ~30s detection; 3s interval → ~10s detection)
+* React immediately when a peer performs a graceful shutdown
+* Never trust unauthenticated input
+* Degrade gracefully if the mesh is not configured
+
+**Wire format:**
+
+```
+POST /internal/peer-heartbeat
+Content-Type: application/json
+X-Peer-Signature: <lowercase hex HMAC-SHA256 of raw body>
+
+{ "node": "europe-1", "timestamp": 1789608000, "healthy": true }
+```
+
+**Security layers:**
+
+1. **Source IP allowlist** — the receiver only accepts heartbeats from IPs that appear in any `NODE<N>_IPV4` or `NODE<N>_IPV6` (plus optional `GEO_PEER_EXTRA_ALLOWED_IPS`).
+2. **HMAC-SHA256 signature** — every payload is signed with `GEO_PEER_SECRET`, a shared hex secret that must be identical on all nodes.
+3. **Timestamp window** — a heartbeat is rejected if its timestamp is more than 60 seconds away from the receiver's clock.
+
+If any check fails, the receiver returns a 404, 400, or 401 status and the payload is dropped before it reaches the health registry.
+
+**Exclusion semantics:**
+
+Once the mesh is enabled, it is authoritative for cross-node health. A peer is excluded from GSLB selection when either:
+
+* Its last successful heartbeat is older than `5 × GEO_PEER_HEARTBEAT_INTERVAL` (tolerates a few dropped heartbeats without flapping), OR
+* Its last heartbeat explicitly reported `healthy: false`
+
+The local node never excludes itself, no matter what the mesh state says.
+
+If the mesh is enabled and all peers have been excluded, the GSLB selection falls back to returning **all configured nodes** rather than SERVFAIL or a single node. This is a safety net: it is better to return three IPs and let the client fail over at the TCP layer than to return nothing.
+
+**Setup:**
+
+1. Generate a shared secret once on any machine:
+
+   ```bash
+   openssl rand -hex 32
+   ```
+
+2. Add to **every node's** systemd unit:
+
+   ```ini
+   Environment=GEO_SELF_NODE=europe-1
+   Environment=GEO_PEER_SECRET=<the hex string>
+   Environment=GEO_PEER_HEARTBEAT_INTERVAL=10
+   ```
+
+   The `GEO_SELF_NODE` value must exactly match the corresponding `NODE<N>_NAME`.
+
+3. Ensure every node has a `NODE<N>_DOH_URL` for the others (including itself, though self is skipped).
+
+4. Ensure TCP port 3053 (or whichever internal port the resolver is listening on) is reachable from the other two nodes. Use the internal port directly rather than going through nginx, so the source IP is preserved and the allowlist works without any header juggling:
+
+   ```ini
+   Environment=NODE1_DOH_URL=https://dns1.example.com:3053
+   Environment=NODE2_DOH_URL=https://dns2.example.com:3053
+   Environment=NODE3_DOH_URL=https://dns3.example.com:3053
+   ```
+
+5. Restart all three nodes within the grace window (a few minutes) so no node is left on the old secret.
+
+**Verification:**
+
+```bash
+# On any node
+sudo journalctl -u unified-dns -f -o cat | grep '\[PEER\]'
+```
+
+Expected on a fully functioning mesh:
+
+```
+[PEER] heartbeat loop started self_node=europe-1 peers=2 interval_secs=10
+[PEER] heartbeat delivered peer=asia-1 rtt_ms=...
+[PEER] heartbeat delivered peer=usa-1 rtt_ms=...
+[PEER] heartbeat applied node=asia-1 healthy=true
+[PEER] heartbeat applied node=usa-1 healthy=true
+```
+
+The `delivered` line is on the sender side; the `applied` line is on the receiver side. Both must appear for the mesh to be functional.
+
+## Multi-IP Failover
+
+By default, the GSLB returns a **single** A or AAAA record per query — the highest-scoring node. This gives strict steering but no DNS-layer failover: if that node dies, clients must re-resolve before they can try another node.
+
+Setting `GEO_IP_FAILOVER_IP` to a value greater than 1 changes this. The resolver returns up to that many A/AAAA records, ordered best-first, excluding any node that the health system has marked unavailable.
+
+| Value | Behavior |
+| --- | --- |
+| `1` (default) | Strict single-IP steering. No DNS-layer failover. |
+| `2` | Best node plus one backup. |
+| `3` | Best plus two backups (all healthy nodes, if all are healthy). |
+| `N` | Up to N healthy nodes, best first. Clamped to `[1, 16]`. |
+
+Clients that respect DNS ordering get strict steering. Clients that shuffle or try multiple IPs in parallel get automatic TCP-layer failover when the first node is unreachable.
+
+**This is the recommended setting for a production deployment with `N ≥ 2`.** It trades a small amount of steering strictness for a large amount of resiliency.
+
+Combined with a short `GEO_ROUTING_TTL` (10 seconds is a good value for a GSLB name), the worst-case failover window is:
+
+```
+node fails
+    ↓
+peer mesh detects (up to 5 × heartbeat_interval, e.g. 15s at 3s interval)
+    ↓
+peers stop including it in responses (immediate after detection)
+    ↓
+client's cached answer expires (up to GEO_ROUTING_TTL)
+    ↓
+client re-resolves, gets a healthy-node-only answer
+```
+
 ## Delegating a GSLB Name
 
 The resolver answers a GSLB name authoritatively only if that name is delegated to it in DNS. This section describes how to set up that delegation correctly.
 
 ### Prerequisites
 
-- A parent zone you control (`example.com` in the examples below)
-- At least one node address reachable over port 53 from the public internet
-- Ability to add NS records and glue A/AAAA records in the parent zone's DNS panel
+* A parent zone you control (`example.com` in the examples below)
+* At least one node address reachable over port 53 from the public internet
+* Ability to add NS records and glue A/AAAA records in the parent zone's DNS panel
 
-The parent zone may be DNSSEC-signed. The delegated child zone is not signed (see the **DNSSEC Status** subsection below).
+The parent zone may be DNSSEC-signed. The delegated child zone is not signed (see **DNSSEC Status** below).
 
 ### Choosing Nameserver Hostnames
 
-The classic pitfall is choosing nameserver hostnames for the delegated zone. Two patterns are common:
+Two patterns are common. The **flat** pattern is strongly preferred.
 
 **Nested (works, but requires glue):**
 ```
 dns.example.com.      NS  ns1.dns.example.com.
 dns.example.com.      NS  ns2.dns.example.com.
-ns1.dns.example.com.  A   1.2.3.4
-ns2.dns.example.com.  A   5.6.7.8
+ns1.dns.example.com.  A   203.0.113.10
+ns2.dns.example.com.  A   198.51.100.20
 ```
 
 **Flat (recommended):**
 ```
 dns.example.com.      NS  ns1.example.com.
 dns.example.com.      NS  ns2.example.com.
-ns1.example.com.      A   1.2.3.4
-ns2.example.com.      A   5.6.7.8
+ns1.example.com.      A   203.0.113.10
+ns2.example.com.      A   198.51.100.20
 ```
 
-The **flat pattern is strongly preferred**. In the nested pattern, `ns1.dns.example.com` lives inside the delegated zone itself, so resolvers must be given its address as **glue** in the referral from the parent. Many DNS providers do not emit glue reliably, and some resolvers will fail or loop while trying to resolve the nameserver address independently. The flat pattern avoids this entirely: `ns1.example.com` lives in the parent zone, so its A record is regular data and no glue is required.
+In the nested pattern, `ns1.dns.example.com` lives inside the delegated zone itself, so resolvers must be given its address as **glue** in the referral from the parent. Many DNS providers do not emit glue reliably, and some resolvers will fail or loop while trying to resolve the nameserver address independently. The flat pattern avoids this entirely: `ns1.example.com` lives in the parent zone, so its A record is regular data and no glue is required.
 
 ### Setup in Cloudflare
 
-Assuming the delegated name is `dns.example.com` and the three nodes are the ones configured above:
+Assuming the delegated name is `dns.example.com`:
 
-**Step 1 — Add glue A records for the nameserver hostnames.**
-
-In the DNS panel for `example.com`:
+**Step 1 — Add A records for the nameserver hostnames.**
 
 ```
-Type: A     Name: ns1     Value: 101.212.112.112     Proxy: OFF
-Type: A     Name: ns2     Value: 191.221.231.111   Proxy: OFF
-Type: A     Name: ns3     Value: 191.221.102.212   Proxy: OFF
+Type: A     Name: ns1     Value: 203.0.113.10      Proxy: OFF
+Type: A     Name: ns2     Value: 198.51.100.20     Proxy: OFF
+Type: A     Name: ns3     Value: 192.0.2.30        Proxy: OFF
 ```
 
 The **Proxy toggle must be off** (grey cloud). Orange-cloud proxying would terminate the DNS request at Cloudflare, defeating the entire GSLB purpose.
 
 **Step 2 — Delete any existing A records for the delegated name itself.**
 
-If the zone has records such as:
-
-```
-dns.example.com    A    1.2.3.4
-dns.example.com    A    5.6.7.8
-```
-
-delete them. They will be shadowed by the NS records anyway, but leaving them causes confusing warnings and makes the zone harder to reason about.
+If the zone has `dns.example.com A 1.2.3.4` records, delete them. They will be shadowed by the NS records anyway, but leaving them causes confusing warnings and makes the zone harder to reason about.
 
 **Step 3 — Add the NS delegation records.**
 
@@ -1062,11 +1239,11 @@ Type: NS     Name: dns     Value: ns2.example.com
 Type: NS     Name: dns     Value: ns3.example.com
 ```
 
-In Cloudflare's UI, `Name: dns` is shorthand for `dns.example.com.`. The `Value` field takes the fully-qualified hostname.
+In Cloudflare's UI, `Name: dns` is shorthand for `dns.example.com.`.
 
 **Step 4 — Do NOT add a DS record.**
 
-If the parent zone is DNSSEC-signed and you add a DS record for the child, DNSSEC-validating resolvers will expect the child to be signed and will reject its unsigned answers. Without a DS record, the child is treated as an **insecure delegation**, which is the correct state until DNSSEC signing for the child zone is implemented (a planned follow-up phase).
+If the parent zone is DNSSEC-signed and you add a DS record for the child, DNSSEC-validating resolvers will expect the child to be signed and will reject its unsigned answers. Without a DS record, the child is treated as an **insecure delegation**, which is the correct state until DNSSEC signing for the child zone is implemented.
 
 ### The "Shadowed Records" Warning
 
@@ -1078,22 +1255,10 @@ This is **expected and correct**. When a name has an NS record, that name become
 
 Click "View shadowed records" to confirm they are the A records you intended to delete, then delete them explicitly.
 
-### Propagation
-
-Once the NS delegation is in place:
-
-1. Resolvers holding a cached A record for `dns.example.com` will keep using it until the TTL expires (typically 300 seconds).
-2. Resolvers holding a cached NS record for `example.com` will keep using it until its TTL expires (typically 86400 seconds, or one day).
-3. New queries follow the delegation to your nodes.
-
-During initial deployment, you can force faster propagation by testing with public resolvers you have not used recently, or by using `+trace` to walk the delegation manually from a clean state.
-
 ### Verification
 
-From any machine:
-
 ```bash
-# Direct trace shows the full delegation path
+# Full trace shows the delegation path
 dig dns.example.com A +trace
 ```
 
@@ -1105,29 +1270,21 @@ dns.example.com. 300 IN NS ns2.example.com.
 dns.example.com. 300 IN NS ns3.example.com.
 ;; Received 606 bytes from 108.162.194.87#53(suzanne.ns.cloudflare.com) in 2 ms
 
-dns.example.com. 30  IN A  101.212.112.112
-;; Received 59 bytes from ns1.example.com in 193 ms
+dns.example.com. 10  IN A  203.0.113.10
+dns.example.com. 10  IN A  198.51.100.20
+dns.example.com. 10  IN A  192.0.2.30
+;; Received 90 bytes from ns1.example.com in 193 ms
 ```
 
-The last two lines are the key: the answer comes from one of your nodes (as indicated by the `from` field), not from the parent zone's nameservers, and it contains exactly one A record.
-
-From clients in different regions:
-
-```bash
-# Each should return a single IP appropriate to that client's region
-dig dns.example.com A @1.1.1.1 +short
-dig dns.example.com A @8.8.8.8 +short
-```
-
-Public resolvers that send EDNS Client Subnet will give the correct regional answer. Public resolvers that do not send ECS will give an answer based on the resolver's own egress location, which may differ from the client's.
+The last few lines are the key: the answers come from one of your nodes (as indicated by the `from` field), not from the parent zone's nameservers.
 
 ### Logging
 
 Every GSLB decision emits a single structured log line:
 
 ```
-[GEO_ROUTING] decision client_region=DE selected_node=europe-1 qtype=A
-    score=0.97 distance_km=301 rtt_ms=0.14 health=healthy
+[GEO_ROUTING] decision client_region=DE selected_node=europe-1 returned_nodes=europe-1,usa-1
+    returned_count=2 qtype=A score=0.97 distance_km=301 rtt_ms=0.14 health=healthy
 ```
 
 Fields:
@@ -1135,7 +1292,9 @@ Fields:
 | Field | Description |
 | --- | --- |
 | `client_region` | ISO-3166 country code from GeoIP, or `??` if unknown |
-| `selected_node` | The chosen node name |
+| `selected_node` | The highest-scoring node |
+| `returned_nodes` | Comma-separated list of every node in the response, best-first |
+| `returned_count` | Number of A/AAAA records in the response |
 | `qtype` | The query type that triggered the decision |
 | `score` | The winning node's composite score |
 | `distance_km` | Haversine distance from client to node, if computable |
@@ -1144,22 +1303,18 @@ Fields:
 
 ## DNSSEC Status of the GSLB Name
 
-The GSLB name is currently delegated but not signed:
-
-- The parent zone (`example.com`) may be DNSSEC-signed
-- No DS record is published for `dns.example.com`
-- The child zone is unsigned
+The GSLB name is currently delegated but not signed. The parent zone may be DNSSEC-signed, no DS record is published for the child, and the child zone is unsigned.
 
 This produces an **insecure delegation** in DNSSEC terms. Validating resolvers accept the answers without setting the AD bit, and without failing validation. The DNS responses are correct; they are simply not cryptographically authenticated.
 
-Signing the child zone (KSK/ZSK generation, RRSIG generation at answer time, DNSKEY publication, DS record at the registrar) is planned as a follow-up phase. Until then, **do not publish a DS record**, as that would cause validating resolvers to reject the unsigned answers.
+Until DNSSEC signing for the child zone is implemented, **do not publish a DS record**, as that would cause validating resolvers to reject the unsigned answers.
 
 ## Limitations
 
-- **Per-client steering relies on ECS or direct source IP.** Queries arriving through a public resolver that does not send ECS will be steered based on that resolver's own egress location, not the client's. This is inherent to GSLB behind any third-party resolver.
-- **Public resolver caching delays re-steering.** A public resolver may cache the answer for the full TTL (30 seconds by default). If a client's best node changes, the resolver will not see the new answer until the TTL expires. Lowering `GEO_ROUTING_TTL` reduces this window at the cost of higher query volume.
-- **Health checks are best-effort.** A node that is reachable but severely degraded (e.g. returning slow responses) will be marked Degraded, not Unhealthy, and may still receive some traffic.
-- **No cross-node state sharing yet.** Each node's GSLB decision is based solely on its own health data. A node with a broken route to another node may still steer clients to that node. A future phase will add an authenticated peer heartbeat between nodes.
+* **Per-client steering relies on ECS or direct source IP.** Queries arriving through a public resolver that does not send ECS will be steered based on that resolver's own egress location, not the client's.
+* **Public resolver caching delays re-steering.** A public resolver may cache the answer for the full TTL. Lowering `GEO_ROUTING_TTL` reduces this window at the cost of higher query volume.
+* **Health checks and peer heartbeats are best-effort.** A node that is reachable but severely degraded (e.g. returning slow responses) will be marked Degraded, not Unhealthy, and may still receive some traffic.
+* **Client bootstrapping.** A client that has configured the GSLB name itself as its only DNS cannot re-resolve the name when the node it reached goes down. This is a fundamental limitation of any non-anycast DNS service and is discussed in deployment notes.
 
 ---
 
@@ -1237,7 +1392,7 @@ A root zone update does not flush the answer cache. A TTL expiry on an individua
 
 # Operational Monitoring
 
-The `/metrics` endpoint returns a JSON snapshot of cache, single-flight, prefetch, and root zone state. It is served by both DoH and DoH3.
+The `/metrics` endpoint returns a JSON snapshot of cache, single-flight, prefetch, root zone, and GSLB state. It is served by both DoH and DoH3.
 
 ```bash
 curl -sk https://dns.example.com/metrics | python3 -m json.tool
@@ -1285,7 +1440,7 @@ Example response:
 }
 ```
 
-The `/metrics` endpoint is not authenticated. If your DoH deployment is public, consider restricting access at the reverse proxy, either by source IP allowlist or by only exposing the endpoint on a loopback port.
+The `/metrics` endpoint is not authenticated. If your DoH deployment is public, restrict access at the reverse proxy (source IP allowlist) or only expose the endpoint on a loopback port.
 
 The `/health` endpoint returns a minimal liveness payload:
 
@@ -1303,45 +1458,19 @@ Nameserver addresses obtained through delegation and glue are validated before b
 
 The resolver rejects unsafe address ranges including:
 
-### IPv4
+**IPv4:** Private networks, loopback, link-local, carrier-grade NAT, benchmark/testing ranges, multicast, unspecified, and other prohibited special-use ranges.
 
-* Private networks
-* Loopback
-* Link-local
-* Carrier-grade NAT
-* Benchmark/testing ranges
-* Multicast
-* Unspecified
-* Other prohibited special-use ranges
+**IPv6:** Loopback, link-local, unique local addresses, multicast, unspecified, and IPv4-mapped unsafe addresses.
 
-### IPv6
-
-* Loopback
-* Link-local
-* Unique Local Addresses
-* Multicast
-* Unspecified
-* IPv4-mapped unsafe addresses
-
-Cloud metadata addresses such as `169.254.169.254` are therefore not accepted as recursive upstream targets.
-
-This prevents malicious DNS delegation data from turning the recursive resolver into an SSRF primitive.
+Cloud metadata addresses such as `169.254.169.254` are therefore not accepted as recursive upstream targets. This prevents malicious DNS delegation data from turning the recursive resolver into an SSRF primitive.
 
 The GSLB health checker applies the same restriction: only node addresses explicitly configured through `NODE<N>_IPV4` and `NODE<N>_IPV6` are ever probed.
 
 ## Reverse-Proxy Header Protection
 
-Headers such as:
+Headers such as `CF-Connecting-IP`, `X-Real-IP`, and `X-Forwarded-For` are trusted only when the immediate connection originates from loopback. Remote clients cannot simply inject proxy headers to impersonate another source address.
 
-```text
-CF-Connecting-IP
-X-Real-IP
-X-Forwarded-For
-```
-
-are trusted only when the immediate connection originates from loopback.
-
-Remote clients cannot simply inject proxy headers to impersonate another source address.
+This same rule protects the peer mesh: the heartbeat receiver trusts forwarded headers only when the connection comes from loopback, matching how the DoH handlers work.
 
 ---
 
@@ -1349,24 +1478,15 @@ Remote clients cannot simply inject proxy headers to impersonate another source 
 
 ## Subnet Token Bucket
 
-Traffic is aggregated by:
-
-* IPv4 `/24`
-* IPv6 `/64`
-
-Token acquisition uses atomic compare-and-update operations to avoid negative token balances under concurrent load.
+Traffic is aggregated by IPv4 `/24` and IPv6 `/64`. Token acquisition uses atomic compare-and-update operations to avoid negative token balances under concurrent load.
 
 ## Transport Isolation
 
-Connection-oriented transports—TCP, DoT, DoQ, DoH, and DoH3—use the subnet token bucket without UDP duplicate-domain penalties.
-
-This avoids incorrectly penalizing legitimate pipelined or multiplexed DNS connections.
+Connection-oriented transports — TCP, DoT, DoQ, DoH, and DoH3 — use the subnet token bucket without UDP duplicate-domain penalties. This avoids incorrectly penalizing legitimate pipelined or multiplexed DNS connections.
 
 ## UDP Duplicate-Domain RRL
 
 UDP duplicate queries (plain DNS) are tracked per domain and time epoch.
-
-The policy is:
 
 ```text
 1st duplicate → allowed
@@ -1376,17 +1496,9 @@ The policy is:
 
 The per-second epoch and counter are updated atomically.
 
-This provides an inexpensive response-rate control mechanism without introducing global locks.
-
 ## RRL Memory Bound
 
-The duplicate-domain tracking table is capped at:
-
-```text
-65,536 entries
-```
-
-When capacity is reached, new domains fall back to normal token-bucket processing rather than causing global UDP traffic to be dropped.
+The duplicate-domain tracking table is capped at 65,536 entries. When capacity is reached, new domains fall back to normal token-bucket processing rather than causing global UDP traffic to be dropped.
 
 ## ANY Queries
 
@@ -1398,72 +1510,89 @@ UDP `ANY` queries are dropped immediately to reduce their usefulness as amplific
 
 ## Core
 
-| Variable                    |            Default | Description                                                                  |
-| --------------------------- | -----------------: | ---------------------------------------------------------------------------- |
-| `HOST`                      |          `0.0.0.0` | Bind address for all listeners                                               |
-| `DNS_PORT`                  |               `53` | Plain DNS port (UDP and TCP); falls back to `5053` when unprivileged         |
-| `DOT_PORT`                  |              `853` | DNS-over-TLS port (TCP); falls back to `8853` when unprivileged               |
-| `DOQ_PORT`                  |              `853` | DNS-over-QUIC port (UDP); falls back to `8853` when unprivileged              |
-| `DOH_PORT`                  |              `443` | DNS-over-HTTPS (HTTP/1.1 & HTTP/2) port (TCP); falls back to `8443`           |
-| `DOH3_PORT`                 |              `443` | DNS-over-HTTP/3 (QUIC) port (UDP); falls back to `8443`                       |
-| `DOH_NO_TLS`                |                `0` | Set to `1` when TLS is terminated upstream by a reverse proxy                |
-| `DNSSEC_ENFORCE`            |                `1` | Return `SERVFAIL` when DNSSEC validation fails                               |
-| `MAX_STALE_SECS`            |              `300` | Maximum stale-serving window                                                 |
-| `RATE_LIMIT_BURST`          |              `300` | Token-bucket burst capacity per client subnet                                |
-| `RATE_LIMIT_PER_SEC`        |               `60` | Token-bucket refill rate per second                                          |
-| `CERT_PATH`                 |    `fullchain.pem` | TLS certificate chain                                                        |
-| `KEY_PATH`                  |      `privkey.pem` | TLS private key                                                              |
-| `RUST_LOG`                  |             `info` | Tracing filter                                                               |
+| Variable | Default | Description |
+| --- | --- | --- |
+| `HOST` | `0.0.0.0` | Bind address for all listeners |
+| `DNS_PORT` | `53` | Plain DNS port (UDP and TCP); falls back to `5053` when unprivileged |
+| `DOT_PORT` | `853` | DNS-over-TLS port (TCP); falls back to `8853` when unprivileged |
+| `DOQ_PORT` | `853` | DNS-over-QUIC port (UDP); falls back to `8853` when unprivileged |
+| `DOH_PORT` | `443` | DNS-over-HTTPS (HTTP/1.1 & HTTP/2) port (TCP); falls back to `8443` |
+| `DOH3_PORT` | `443` | DNS-over-HTTP/3 (QUIC) port (UDP); falls back to `8443` |
+| `DOH_NO_TLS` | `0` | Set to `1` when TLS is terminated upstream by a reverse proxy |
+| `DNSSEC_ENFORCE` | `1` | Return `SERVFAIL` when DNSSEC validation fails |
+| `MAX_STALE_SECS` | `300` | Maximum stale-serving window |
+| `RATE_LIMIT_BURST` | `300` | Token-bucket burst capacity per client subnet |
+| `RATE_LIMIT_PER_SEC` | `60` | Token-bucket refill rate per second |
+| `CERT_PATH` | `fullchain.pem` | TLS certificate chain |
+| `KEY_PATH` | `privkey.pem` | TLS private key |
+| `RUST_LOG` | `info` | Tracing filter |
 
 ## Cache
 
-| Variable                    |            Default | Description                                                                  |
-| --------------------------- | -----------------: | ---------------------------------------------------------------------------- |
-| `CACHE_FILE`                |       `cache.json` | Persistent cache path; relative paths resolve against the working directory  |
-| `CACHE_ENABLED`             |                `1` | Set to `0` to disable answer-cache reads and writes                          |
-| `CACHE_MAX_ENTRIES`         |          `500000` | Maximum number of cached answer/negative entries                             |
-| `CACHE_PREFETCH`            |                `1` | Enable or disable background prefetch of hot records                         |
-| `CACHE_PREFETCH_THRESHOLD_PCT` |            `15` | Prefetch threshold as a percentage of original TTL                          |
-| `CACHE_PREFETCH_MIN_HITS`   |                `5` | Minimum hits before a record is eligible for prefetch                        |
-| `HIT_TRACKER_MAX_ENTRIES`   |         `100000` | Maximum keys tracked for popularity scoring                                  |
+| Variable | Default | Description |
+| --- | --- | --- |
+| `CACHE_FILE` | `cache.json` | Persistent cache path; relative paths resolve against the working directory |
+| `CACHE_ENABLED` | `1` | Set to `0` to disable answer-cache reads and writes |
+| `CACHE_MAX_ENTRIES` | `500000` | Maximum number of cached answer/negative entries |
+| `CACHE_PREFETCH` | `1` | Enable or disable background prefetch of hot records |
+| `CACHE_PREFETCH_THRESHOLD_PCT` | `15` | Prefetch threshold as a percentage of original TTL |
+| `CACHE_PREFETCH_MIN_HITS` | `5` | Minimum hits before a record is eligible for prefetch |
+| `HIT_TRACKER_MAX_ENTRIES` | `100000` | Maximum keys tracked for popularity scoring |
 
 ## Pre-Warming
 
-| Variable                    |            Default | Description                                                                  |
-| --------------------------- | -----------------: | ---------------------------------------------------------------------------- |
-| `WARM_LIMIT`                |                `0` | Number of Tranco domains to pre-warm; `0` disables pre-warming               |
-| `WARM_CONCURRENCY`          |                `6` | Maximum concurrent pre-warming operations                                    |
-| `TRANCO_FILE`               | `tranco_list.txt` | Tranco list cache path; relative paths resolve against the working directory |
+| Variable | Default | Description |
+| --- | --- | --- |
+| `WARM_LIMIT` | `0` | Number of Tranco domains to pre-warm; `0` disables pre-warming |
+| `WARM_CONCURRENCY` | `6` | Maximum concurrent pre-warming operations |
+| `TRANCO_FILE` | `tranco_list.txt` | Tranco list cache path; relative paths resolve against the working directory |
 
 ## Root Zone
 
-| Variable                    |            Default | Description                                                                  |
-| --------------------------- | -----------------: | ---------------------------------------------------------------------------- |
-| `ROOT_ZONE_FILE`            |        `root.zone` | Local root zone text file; relative paths resolve against working directory  |
-| `ROOT_ZONE_CACHE`           |   `root_zone.json` | Pre-parsed JSON cache; derived from `ROOT_ZONE_FILE` if unset                |
-| `ROOT_ZONE_URL`             | `https://www.internic.net/domain/root.zone` | Source URL for root zone downloads |
-| `ROOT_ZONE_MAX_AGE_DAYS`    |               `30` | Age after which the root zone is considered too old                          |
-| `ROOT_ZONE_REFRESH_HOURS`   |             `168` | In-process root zone refresh interval                                        |
+| Variable | Default | Description |
+| --- | --- | --- |
+| `ROOT_ZONE_FILE` | `root.zone` | Local root zone text file; relative paths resolve against working directory |
+| `ROOT_ZONE_CACHE` | `root_zone.json` | Pre-parsed JSON cache; derived from `ROOT_ZONE_FILE` if unset |
+| `ROOT_ZONE_URL` | `https://www.internic.net/domain/root.zone` | Source URL for root zone downloads |
+| `ROOT_ZONE_MAX_AGE_DAYS` | `30` | Age after which the root zone is considered too old |
+| `ROOT_ZONE_REFRESH_HOURS` | `168` | In-process root zone refresh interval |
 
 ## Geo-Aware GSLB
 
-| Variable                    |            Default | Description                                                                  |
-| --------------------------- | -----------------: | ---------------------------------------------------------------------------- |
-| `GEO_ROUTING_ENABLED`       |                `0` | Set to `1` to enable the GSLB layer                                          |
-| `GEO_AUTHORITATIVE_NAMES`   |          *(unset)* | Comma-separated list of names this resolver is authoritative for             |
-| `GEOIP_DATABASE`            |          *(unset)* | Path to MaxMind GeoLite2-City `.mmdb` database                               |
-| `GEO_ROUTING_TTL`           |               `30` | TTL of the returned A/AAAA record                                            |
-| `GEO_HEALTH_INTERVAL`       |               `30` | Seconds between health probes per node                                       |
-| `GEO_HYSTERESIS_PCT`        |               `15` | Minimum score delta required to switch nodes (reserved)                      |
-| `GEO_DEFAULT_NODE`          |          *(unset)* | Node name used when no eligible node exists (fallback)                       |
-| `NODE<N>_NAME`              |          *(unset)* | Unique node identifier; unset `NODE<N>_NAME` terminates the list             |
-| `NODE<N>_IPV4`              |          *(unset)* | IPv4 address returned to A queries                                           |
-| `NODE<N>_IPV6`              |          *(unset)* | IPv6 address returned to AAAA queries                                        |
-| `NODE<N>_LOCATION`          |          *(unset)* | Human-readable region tag (informational)                                    |
-| `NODE<N>_LAT`               |          *(unset)* | Latitude for geographic scoring                                              |
-| `NODE<N>_LON`               |          *(unset)* | Longitude for geographic scoring                                             |
-| `NODE<N>_ENABLED`           |             `true` | Set to `false` to disable a node                                             |
-| `GEO_IP_FAILOVER_IP`        |             `1 or 2 or 3+ or N ` | Set to `false` to disable a node                               |
+| Variable | Default | Description |
+| --- | --- | --- |
+| `GEO_ROUTING_ENABLED` | `0` | Set to `1` to enable the GSLB layer |
+| `GEO_AUTHORITATIVE_NAMES` | *(unset)* | Comma-separated list of names this resolver is authoritative for |
+| `GEOIP_DATABASE` | *(unset)* | Path to MaxMind GeoLite2-City `.mmdb` database |
+| `GEO_ROUTING_TTL` | `30` | TTL of the returned A/AAAA records |
+| `GEO_HEALTH_INTERVAL` | `30` | Seconds between local UDP health probes per node |
+| `GEO_HYSTERESIS_PCT` | `15` | Minimum score delta required to switch nodes (reserved) |
+| `GEO_DEFAULT_NODE` | *(unset)* | Node name used when no eligible node exists (fallback) |
+| `GEO_IP_FAILOVER_IP` | `1` | Number of A/AAAA records returned per GSLB response. `1` = strict single-IP steering (no DNS-layer failover). `2+` = ordered multi-IP enabling TCP-layer failover. Clamped to `[1, 16]`. |
+
+## GSLB Nodes
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `NODE<N>_NAME` | *(unset)* | Unique node identifier; unset `NODE<N>_NAME` terminates the list |
+| `NODE<N>_IPV4` | *(unset)* | IPv4 address returned to A queries |
+| `NODE<N>_IPV6` | *(unset)* | IPv6 address returned to AAAA queries |
+| `NODE<N>_DOH_URL` | *(unset)* | Base URL of the node's DoH endpoint, used by the peer mesh heartbeat sender |
+| `NODE<N>_LOCATION` | *(unset)* | Human-readable region tag (informational) |
+| `NODE<N>_LAT` | *(unset)* | Latitude for geographic scoring |
+| `NODE<N>_LON` | *(unset)* | Longitude for geographic scoring |
+| `NODE<N>_ENABLED` | `true` | Set to `false` to disable a node |
+
+## Peer Mesh
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `GEO_SELF_NODE` | *(unset)* | Name of this node, matching one of the `NODE<N>_NAME` values. If unset, the peer mesh is disabled. |
+| `GEO_PEER_SECRET` | *(unset)* | Shared HMAC-SHA256 secret, as a hex string of at least 16 bytes. Must be identical on all nodes. If unset, the peer mesh is disabled. |
+| `GEO_PEER_HEARTBEAT_INTERVAL` | `10` | Seconds between outbound peer heartbeats. Minimum 2. |
+| `GEO_PEER_EXTRA_ALLOWED_IPS` | *(unset)* | Comma-separated list of additional source IPs permitted to POST to `/internal/peer-heartbeat`. Normally not needed; the node address list is used automatically. |
+| `PEER_INSECURE_TLS` | `0` | Set to `1` to accept self-signed TLS certificates on peer heartbeat deliveries. Only for testing. |
+
 ---
 
 # Building
@@ -1474,15 +1603,9 @@ The project requires Rust and Cargo.
 cargo build --release
 ```
 
-The resulting executable is:
+The resulting executable is `./target/release/unified-dns`.
 
-```text
-./target/release/unified-dns
-```
-
-For privileged ports, either run with the appropriate capability or use the configured high-port fallbacks.
-
-For example:
+For privileged ports, either run with the appropriate capability or use the configured high-port fallbacks:
 
 ```bash
 sudo setcap 'cap_net_bind_service=+ep' ./target/release/unified-dns
@@ -1499,19 +1622,17 @@ ML-DSA-44 signature: 2,420 bytes
 ML-DSA-44 public key: 1,312 bytes
 ```
 
-Consequently, DNS responses containing Algorithm 18 signatures can exceed the 1,232-byte EDNS payload target recommended for avoiding IP fragmentation.
-
-The resolver handles `TC=1` responses by retrying the query over TCP.
+Consequently, DNS responses containing Algorithm 18 signatures can exceed the 1,232-byte EDNS payload target recommended for avoiding IP fragmentation. The resolver handles `TC=1` responses by retrying the query over TCP.
 
 ---
 
 # Deployment
 
-## Option A, Standalone Deployment
+## Option A — Standalone Deployment
 
 The resolver terminates DoT, DoQ, DoH (HTTP/1.1 and HTTP/2), and DoH3 (HTTP/3 over QUIC) directly.
 
-Example systemd service with GSLB enabled:
+Example systemd service with GSLB and peer mesh enabled:
 
 ```ini
 [Unit]
@@ -1521,10 +1642,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=doh
-Group=doh
-WorkingDirectory=/var/lib/unified-dns
-ExecStart=/usr/local/bin/unified-dns
+User=unified-dns
+Group=unified-dns
+WorkingDirectory=/opt/unified-dns
+ExecStart=/opt/unified-dns/unified-dns
 
 # Listener configuration
 Environment="HOST=0.0.0.0"
@@ -1544,52 +1665,55 @@ Environment="RATE_LIMIT_BURST=300"
 Environment="RATE_LIMIT_PER_SEC=60"
 
 # TLS
-Environment="CERT_PATH=/etc/letsencrypt/live/dns.example.com/fullchain.pem"
-Environment="KEY_PATH=/etc/letsencrypt/live/dns.example.com/privkey.pem"
+Environment="CERT_PATH=/opt/unified-dns/certs/fullchain.pem"
+Environment="KEY_PATH=/opt/unified-dns/certs/privkey.pem"
 
-# Cache
+# Cache (relative paths resolve against WorkingDirectory)
 Environment="CACHE_FILE=cache.json"
 Environment="CACHE_MAX_ENTRIES=500000"
 Environment="CACHE_PREFETCH=1"
 
-# Root zone — relative paths resolve against WorkingDirectory
+# Root zone (relative paths resolve against WorkingDirectory)
 #Environment="ROOT_ZONE_FILE=root.zone"
 #Environment="ROOT_ZONE_REFRESH_HOURS=168"
 
 # Geo-aware GSLB
-Environment=GEO_PEER_SECRET="HEX SECRET KEY" #FOR HEARTBEATS MUST BE THE SAME ON ALL NODES
-Environment=GEO_PEER_HEARTBEAT_INTERVAL=10
-
-Environment="GEO_IP_FAILOVER_IP=3"
 Environment="GEO_ROUTING_ENABLED=1"
 Environment="GEO_AUTHORITATIVE_NAMES=dns.example.com"
 Environment="GEOIP_DATABASE=GeoLite2-City.mmdb"
-Environment="GEO_ROUTING_TTL=30"
-Environment="GEO_HEALTH_INTERVAL=30"
+Environment="GEO_ROUTING_TTL=10"
+Environment="GEO_HEALTH_INTERVAL=10"
+Environment="GEO_IP_FAILOVER_IP=3"
 
+# Peer mesh — set GEO_SELF_NODE to match this node's NODE<N>_NAME
+Environment="GEO_SELF_NODE=europe-1"
+Environment="GEO_PEER_SECRET=<replace with 64-char hex secret>"
+Environment="GEO_PEER_HEARTBEAT_INTERVAL=3"
+
+# Nodes (identical list on all nodes)
 Environment="NODE1_NAME=asia-1"
-Environment="NODE1_IPV4=101.212.112.112"
+Environment="NODE1_IPV4=203.0.113.10"
+Environment="NODE1_DOH_URL=https://dns1.example.com:3053"
 Environment="NODE1_LOCATION=asia"
 Environment="NODE1_LAT=1.3521"
 Environment="NODE1_LON=103.8198"
 Environment="NODE1_ENABLED=true"
-Environment=NODE1_DOH_URL="https://dns1.example.ca" #FOR HEARTBEATS AND FAILOVER
 
 Environment="NODE2_NAME=europe-1"
-Environment="NODE2_IPV4=191.221.231.111"
+Environment="NODE2_IPV4=198.51.100.20"
+Environment="NODE2_DOH_URL=https://dns2.example.com:3053"
 Environment="NODE2_LOCATION=europe"
 Environment="NODE2_LAT=52.5200"
 Environment="NODE2_LON=13.4050"
 Environment="NODE2_ENABLED=true"
-Environment=NODE2_DOH_URL="https://dns2.example.ca" #FOR HEARTBEATS AND FAILOVER
 
 Environment="NODE3_NAME=usa-1"
-Environment="NODE3_IPV4=191.221.102.212"
+Environment="NODE3_IPV4=192.0.2.30"
+Environment="NODE3_DOH_URL=https://dns3.example.com:3053"
 Environment="NODE3_LOCATION=north_america"
 Environment="NODE3_LAT=40.7128"
 Environment="NODE3_LON=-74.0060"
 Environment="NODE3_ENABLED=true"
-Environment=NODE2_DOH_URL="https://dns3.example.ca"  #FOR HEARTBEATS AND FAILOVER
 
 # Logging
 Environment="RUST_LOG=info,unified_dns=info"
@@ -1609,27 +1733,11 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now unified-dns.service
 ```
 
-Optional first-time setup for GSLB:
+Then configure the delegation in your parent zone's DNS panel as described in [Delegating a GSLB Name](#delegating-a-gslb-name).
 
-```bash
-# Fetch root zone (for recursive performance)
-sudo -u doh curl -sS -o /var/lib/unified-dns/root.zone \
-    https://www.internic.net/domain/root.zone
-
-# Download MaxMind GeoLite2-City (requires free MaxMind account)
-# https://www.maxmind.com/en/geolite2/signup
-sudo -u doh cp GeoLite2-City.mmdb /var/lib/unified-dns/
-```
-
-Then configure the delegation in your parent zone's DNS panel as described in the **Delegating a GSLB Name** section above.
-
----
-
-## Option B, Reverse Proxy Deployment
+## Option B — Reverse Proxy Deployment
 
 A reverse proxy can terminate public HTTPS and HTTP/3 while the resolver listens locally in unencrypted HTTP mode.
-
-Example architecture:
 
 ```text
 Internet
@@ -1678,7 +1786,6 @@ server {
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers HIGH:!aNULL:!MD5;
 
-    # Advertise HTTP/3 support to connecting clients
     add_header Alt-Svc 'h3=":443"; ma=86400' always;
 
     client_max_body_size 10k;
@@ -1702,8 +1809,7 @@ server {
         proxy_set_header Host $host;
     }
 
-    # Metrics: restrict access. Do not expose to the public internet
-    # without an allowlist.
+    # Metrics: restrict access.
     location = /metrics {
         allow 127.0.0.1;
         allow 10.0.0.0/8;
@@ -1712,10 +1818,23 @@ server {
         proxy_pass http://doh_backend/metrics;
         proxy_set_header Host $host;
     }
+
+    # Peer heartbeat: only reachable from the other nodes' IPs.
+    location = /internal/peer-heartbeat {
+        allow 203.0.113.10;
+        allow 198.51.100.20;
+        allow 192.0.2.30;
+        deny all;
+
+        proxy_pass http://doh_backend/internal/peer-heartbeat;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header Host $host;
+    }
 }
 ```
 
-The resolver's proxy-header protection ensures forwarded client identity is only trusted when the immediate connection is from a trusted local proxy.
+The resolver's proxy-header protection ensures forwarded client identity is only trusted when the immediate connection is from a trusted local proxy. The peer heartbeat allowlist has the same property: the resolver rejects any request from a source IP that is not in its node list, regardless of what headers are sent.
 
 ---
 
@@ -1725,11 +1844,6 @@ The resolver's proxy-header protection ensures forwarded client identity is only
 
 ```bash
 dig @127.0.0.1 -p 53 example.com A +dnssec
-```
-
-TCP:
-
-```bash
 dig +tcp @127.0.0.1 -p 53 example.com A +dnssec
 ```
 
@@ -1737,6 +1851,12 @@ dig +tcp @127.0.0.1 -p 53 example.com A +dnssec
 
 ```bash
 kdig -d @dns.example.com:853 +tls example.com A
+```
+
+Or with BIND 9.18+ `dig`:
+
+```bash
+dig @dns.example.com +tls example.com A +short
 ```
 
 ## DNS-over-QUIC (DoQ)
@@ -1771,25 +1891,10 @@ curl -s \
 
 ## DNS-over-HTTP/3 (DoH3)
 
-### GET (HTTP/3 over QUIC)
-
 ```bash
 curl --http3 -s \
   -H "Accept: application/dns-message" \
   "https://dns.example.com/dns-query?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB" \
-  | hexdump -C
-```
-
-### POST (HTTP/3 over QUIC)
-
-```bash
-echo -n "AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB" \
-  | base64 -d \
-  | curl --http3 -s -X POST \
-      --data-binary @- \
-      -H "Content-Type: application/dns-message" \
-      -H "Accept: application/dns-message" \
-      https://dns.example.com/dns-query \
   | hexdump -C
 ```
 
@@ -1802,13 +1907,19 @@ curl -sk https://dns.example.com/metrics | python3 -m json.tool
 ## GSLB Steering
 
 ```bash
-# Verify the delegation resolves and returns a single A record
+# Full delegation trace
 dig dns.example.com A +trace
 
-# Verify that the resolver returns different regional IPs for different clients
-# (from clients in different regions, or via public resolvers)
+# Verify regional steering via public resolvers
 dig dns.example.com A @1.1.1.1 +short
 dig dns.example.com A @8.8.8.8 +short
+```
+
+## Peer Mesh
+
+```bash
+# On any node, watch heartbeat send and receive
+sudo journalctl -u unified-dns -f -o cat | grep '\[PEER\]'
 ```
 
 ## DNSSEC Failure Test
@@ -1817,11 +1928,7 @@ dig dns.example.com A @8.8.8.8 +short
 dig @127.0.0.1 -p 53 dnssec-failed.org A
 ```
 
-Expected result:
-
-```text
-SERVFAIL
-```
+Expected result: `SERVFAIL`.
 
 ## Valid DNSSEC Test
 
@@ -1829,57 +1936,53 @@ SERVFAIL
 dig @127.0.0.1 -p 53 cloudflare.com A +dnssec
 ```
 
-Expected result:
-
-```text
-NOERROR
-flags: ... ad ...
-```
+Expected result: `NOERROR` with `flags: ... ad ...`.
 
 ---
 
 # Security Model
 
-| Threat                               | Mitigation                                                                                      |
-| ------------------------------------ | ----------------------------------------------------------------------------------------------- |
-| Broken root trust chain              | Strict DNSSEC validation and fail-closed enforcement                                            |
-| DS stripping / downgrade             | Authenticated DS nonexistence proofs required                                                   |
-| Parent DS rollover desynchronization | Child DNSKEY trust lifetime bounded by parent DS TTL                                            |
-| DNSSEC signature expiration          | Effective cache TTL bounded by required RRSIG validity                                          |
-| Forged negative responses            | Cryptographically validated NSEC/NSEC3 proofs                                                   |
-| NSEC3 Opt-Out abuse                  | Opt-Out accepted only for appropriate insecure delegations                                      |
-| DNS cache poisoning                  | Transaction ID validation, response matching, bailiwick controls, randomized upstream selection |
-| Forged/out-of-bailiwick glue         | Bailiwick validation and independent resolution                                                 |
-| Recursive SSRF                       | Special-use/private/link-local/metadata address filtering                                       |
-| Broken EDNS servers                  | EDNS fallback to plain DNS                                                                      |
-| Slow authoritative servers           | Whole-transaction TCP timeouts and bounded recursion                                            |
-| CNAME/DNAME loops                    | Hop limits and cycle detection                                                                  |
-| DNAME name overflow                  | RFC 6672 name-length validation                                                                 |
-| DNSSEC algorithmic DoS               | Per-validation signature budget                                                                 |
-| DNS amplification                    | ANY handling, response-size enforcement, UDP duplicate-domain RRL                               |
-| Volumetric flooding                  | Subnet token-bucket rate limiting                                                               |
-| UDP duplicate flooding               | Atomic per-domain RRL                                                                           |
-| Stale DNSSEC authentication          | Stale responses always clear `AD`                                                               |
-| Zombie cache entries                 | Hard expiration after stale window                                                              |
-| Legacy cache downgrade               | Entries without explicit DNSSEC state are discarded                                             |
-| Proxy identity spoofing              | Forwarded headers trusted only from loopback                                                    |
-| UDP application truncation           | 65,535-byte receive buffer                                                                      |
-| QUIC / HTTP/3 HoL blocking           | Multiplexed, independent byte streams per DNS query via QUIC                                    |
-| Post-quantum response truncation     | Automatic TCP retry after `TC=1`                                                                |
-| Cache memory exhaustion              | Bounded W-TinyLFU admission with configurable capacity                                          |
-| Thundering herd on cache miss        | Per-key single-flight coalescing                                                                |
-| Root zone tampering                  | Downloaded over TLS; parse validation; atomic swap; previous known-good retained on failure      |
-| Stale root zone data                 | Explicit staleness states; fallback to live root servers when too old                            |
-| GSLB cache poisoning                 | GSLB decisions run before the shared cache and are never cached                                  |
-| GSLB node address injection          | Node addresses accepted only from `NODE<N>_IPV4` / `NODE<N>_IPV6` env vars                       |
-| GSLB health check SSRF               | Only configured node addresses are probed; query data is never used as a target                  |
-| ECS spoofing                         | ECS is used only for GeoIP lookup, not for routing decisions in isolation; source IP is preferred when ECS is absent |
+| Threat | Mitigation |
+| --- | --- |
+| Broken root trust chain | Strict DNSSEC validation and fail-closed enforcement |
+| DS stripping / downgrade | Authenticated DS nonexistence proofs required |
+| Parent DS rollover desynchronization | Child DNSKEY trust lifetime bounded by parent DS TTL |
+| DNSSEC signature expiration | Effective cache TTL bounded by required RRSIG validity |
+| Forged negative responses | Cryptographically validated NSEC/NSEC3 proofs |
+| NSEC3 Opt-Out abuse | Opt-Out accepted only for appropriate insecure delegations |
+| DNS cache poisoning | Transaction ID validation, response matching, bailiwick controls, randomized upstream selection |
+| Forged/out-of-bailiwick glue | Bailiwick validation and independent resolution |
+| Recursive SSRF | Special-use/private/link-local/metadata address filtering |
+| Broken EDNS servers | EDNS fallback to plain DNS |
+| Slow authoritative servers | Whole-transaction TCP timeouts and bounded recursion |
+| CNAME/DNAME loops | Hop limits and cycle detection |
+| DNAME name overflow | RFC 6672 name-length validation |
+| DNSSEC algorithmic DoS | Per-validation signature budget |
+| DNS amplification | ANY handling, response-size enforcement, UDP duplicate-domain RRL |
+| Volumetric flooding | Subnet token-bucket rate limiting |
+| UDP duplicate flooding | Atomic per-domain RRL |
+| Stale DNSSEC authentication | Stale responses always clear `AD` |
+| Zombie cache entries | Hard expiration after stale window |
+| Legacy cache downgrade | Entries without explicit DNSSEC state are discarded |
+| Proxy identity spoofing | Forwarded headers trusted only from loopback |
+| UDP application truncation | 65,535-byte receive buffer |
+| QUIC / HTTP/3 HoL blocking | Multiplexed, independent byte streams per DNS query via QUIC |
+| Post-quantum response truncation | Automatic TCP retry after `TC=1` |
+| Cache memory exhaustion | Bounded W-TinyLFU admission with configurable capacity |
+| Thundering herd on cache miss | Per-key single-flight coalescing |
+| Root zone tampering | Downloaded over TLS; parse validation; atomic swap; previous known-good retained on failure |
+| Stale root zone data | Explicit staleness states; fallback to live root servers when too old |
+| GSLB cache poisoning | GSLB decisions run before the shared cache and are never cached |
+| GSLB node address injection | Node addresses accepted only from `NODE<N>_IPV4` / `NODE<N>_IPV6` env vars |
+| GSLB health check SSRF | Only configured node addresses are probed; query data is never used as a target |
+| ECS spoofing | ECS is used only for GeoIP lookup, not for routing decisions in isolation; source IP is preferred when ECS is absent |
+| Peer heartbeat spoofing | HMAC-SHA256 signature over the raw body, source IP allowlist, 60-second timestamp window |
+| Peer mesh silent-failure false positive | Five-heartbeat grace window before a silent peer is presumed dead |
+| Peer mesh lock-in | Fallback returns all configured nodes if the health filter excludes everything |
 
 ---
 
 # Design Principles
-
-The resolver is built around several core principles:
 
 ### 1. Resolve, don't forward
 
@@ -1915,7 +2018,7 @@ Delegation glue and resolved nameserver addresses are filtered before they can b
 
 ### 9. Separate lifecycles for separate concerns
 
-The answer cache, delegation cache, DNSSEC key caches, root zone, and GSLB health state each have their own expiration and refresh behavior. No single mechanism governs all of them, and no single event invalidates all of them.
+The answer cache, delegation cache, DNSSEC key caches, root zone, GSLB health state, and peer mesh each have their own expiration and refresh behavior. No single mechanism governs all of them, and no single event invalidates all of them.
 
 ### 10. Coalesce, don't multiply
 
@@ -1925,10 +2028,12 @@ Concurrent identical requests share a single upstream resolution. Concurrent unr
 
 When the resolver acts as an authoritative GSLB, the per-client steering decision is computed on the request path and never stored in the shared recursive cache. Two clients with different geographic origins can receive different answers for the same name without either affecting the other.
 
+### 12. Return something over returning nothing
+
+When the health system has excluded every node, when the peer mesh has not yet received its first heartbeat, or when any other signal is ambiguous, the resolver prefers to return all configured nodes rather than SERVFAIL or a single node. A client that receives three IPs can fail over at the TCP layer; a client that receives SERVFAIL cannot.
+
 ---
 
 # License
 
 This project is licensed under the **MIT License**.
-
-
