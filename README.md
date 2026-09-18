@@ -60,7 +60,7 @@ Optionally, the same process can act as a small authoritative nameserver for a c
 
 ## Prerequisites
 
-**Rust toolchain** — Rust 1.75 or newer. Install via [rustup](https://rustup.rs/):
+**Rust toolchain** , Rust 1.75 or newer. Install via [rustup](https://rustup.rs/):
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -68,7 +68,7 @@ source "$HOME/.cargo/env"
 rustc --version
 ```
 
-**Linux build dependencies** — the resolver needs a C toolchain and standard headers for the crypto backends (`ring`, `ml-dsa`). On common distributions:
+**Linux build dependencies** , the resolver needs a C toolchain and standard headers for the crypto backends (`ring`, `ml-dsa`). On common distributions:
 
 ```bash
 # Debian / Ubuntu
@@ -82,7 +82,7 @@ sudo dnf install -y gcc gcc-c++ make pkg-config openssl-devel
 sudo pacman -S --needed base-devel pkgconf openssl
 ```
 
-**Runtime ports** — the resolver binds privileged ports by default (53, 853, 443). Either run as root, grant `CAP_NET_BIND_SERVICE`, or use the built-in unprivileged fallback ports (5053, 8853, 8443).
+**Runtime ports** , the resolver binds privileged ports by default (53, 853, 443). Either run as root, grant `CAP_NET_BIND_SERVICE`, or use the built-in unprivileged fallback ports (5053, 8853, 8443).
 
 ```bash
 sudo setcap 'cap_net_bind_service=+ep' /path/to/unified-dns
@@ -444,9 +444,9 @@ HTTP request validation distinguishes protocol errors from DNS resolution errors
 
 The DoH router also exposes operational endpoints:
 
-* `GET /health` — lightweight liveness probe
-* `GET /metrics` — JSON snapshot of cache, single-flight, prefetch, root zone, and GSLB state
-* `POST /internal/peer-heartbeat` — authenticated inter-node health mesh receiver (see [Peer Mesh](#peer-mesh-cross-node-health))
+* `GET /health` , lightweight liveness probe
+* `GET /metrics` , JSON snapshot of cache, single-flight, prefetch, root zone, and GSLB state
+* `POST /internal/peer-heartbeat` , authenticated inter-node health mesh receiver (see [Peer Mesh](#peer-mesh-cross-node-health))
 
 ### RFC 9114 / RFC 9000 DoH3 (DNS-over-HTTP/3)
 
@@ -883,11 +883,11 @@ The cryptographic `Original TTL` contained inside RRSIG RDATA is never modified.
 
 Each cache entry has one of three runtime freshness states.
 
-**Fresh** (`age < effective TTL`) — served immediately with dynamically aged record TTLs.
+**Fresh** (`age < effective TTL`) , served immediately with dynamically aged record TTLs.
 
-**Stale** (`effective TTL <= age < effective TTL + MAX_STALE_SECS`) — served under RFC 8767 stale-answer handling. Stale responses receive a positive 30-second wire TTL and trigger asynchronous background revalidation. Stale DNSSEC responses always clear `AD=0`.
+**Stale** (`effective TTL <= age < effective TTL + MAX_STALE_SECS`) , served under RFC 8767 stale-answer handling. Stale responses receive a positive 30-second wire TTL and trigger asynchronous background revalidation. Stale DNSSEC responses always clear `AD=0`.
 
-**Expired** (`age >= effective TTL + MAX_STALE_SECS`) — the cached response is no longer served. The resolver performs synchronous recursive resolution instead. If resolution fails, the resolver returns `SERVFAIL` rather than resurrecting an expired response.
+**Expired** (`age >= effective TTL + MAX_STALE_SECS`) , the cached response is no longer served. The resolver performs synchronous recursive resolution instead. If resolution fails, the resolver returns `SERVFAIL` rather than resurrecting an expired response.
 
 ## Client-Specific Response Construction
 
@@ -1012,8 +1012,8 @@ Nodes without a configured IPv6 address are automatically excluded from AAAA sel
 
 The client's location is derived from, in order of preference:
 
-1. **EDNS Client Subnet (ECS)** — when the upstream resolver (Google, Cloudflare, etc.) includes an ECS option, the subnet's network address is used as the GeoIP lookup key. This is the accurate case: the public resolver is telling us where the actual client is.
-2. **Raw source IP** — when ECS is absent, the connection's source address is used. This is accurate when the client speaks directly to the resolver (DoH to your own endpoint, or plain DNS from a stub), and inaccurate when the query comes through a third-party recursive resolver (the source IP is the resolver's own egress address).
+1. **EDNS Client Subnet (ECS)** , when the upstream resolver (Google, Cloudflare, etc.) includes an ECS option, the subnet's network address is used as the GeoIP lookup key. This is the accurate case: the public resolver is telling us where the actual client is.
+2. **Raw source IP** , when ECS is absent, the connection's source address is used. This is accurate when the client speaks directly to the resolver (DoH to your own endpoint, or plain DNS from a stub), and inaccurate when the query comes through a third-party recursive resolver (the source IP is the resolver's own egress address).
 
 The ECS subnet is masked to the advertised prefix length before being used, so full client precision is never stored.
 
@@ -1082,9 +1082,9 @@ X-Peer-Signature: <lowercase hex HMAC-SHA256 of raw body>
 
 **Security layers:**
 
-1. **Source IP allowlist** — the receiver only accepts heartbeats from IPs that appear in any `NODE<N>_IPV4` or `NODE<N>_IPV6` (plus optional `GEO_PEER_EXTRA_ALLOWED_IPS`).
-2. **HMAC-SHA256 signature** — every payload is signed with `GEO_PEER_SECRET`, a shared hex secret that must be identical on all nodes.
-3. **Timestamp window** — a heartbeat is rejected if its timestamp is more than 60 seconds away from the receiver's clock.
+1. **Source IP allowlist** , the receiver only accepts heartbeats from IPs that appear in any `NODE<N>_IPV4` or `NODE<N>_IPV6` (plus optional `GEO_PEER_EXTRA_ALLOWED_IPS`).
+2. **HMAC-SHA256 signature** , every payload is signed with `GEO_PEER_SECRET`, a shared hex secret that must be identical on all nodes.
+3. **Timestamp window** , a heartbeat is rejected if its timestamp is more than 60 seconds away from the receiver's clock.
 
 If any check fails, the receiver returns a 404, 400, or 401 status and the payload is dropped before it reaches the health registry.
 
@@ -1150,7 +1150,7 @@ The `delivered` line is on the sender side; the `applied` line is on the receive
 
 ## Multi-IP Failover
 
-By default, the GSLB returns a **single** A or AAAA record per query — the highest-scoring node. This gives strict steering but no DNS-layer failover: if that node dies, clients must re-resolve before they can try another node.
+By default, the GSLB returns a **single** A or AAAA record per query , the highest-scoring node. This gives strict steering but no DNS-layer failover: if that node dies, clients must re-resolve before they can try another node.
 
 Setting `GEO_IP_FAILOVER_IP` to a value greater than 1 changes this. The resolver returns up to that many A/AAAA records, ordered best-first, excluding any node that the health system has marked unavailable.
 
@@ -1217,7 +1217,7 @@ In the nested pattern, `ns1.dns.example.com` lives inside the delegated zone its
 
 Assuming the delegated name is `dns.example.com`:
 
-**Step 1 — Add A records for the nameserver hostnames.**
+**Step 1 , Add A records for the nameserver hostnames.**
 
 ```
 Type: A     Name: ns1     Value: 203.0.113.10      Proxy: OFF
@@ -1227,11 +1227,11 @@ Type: A     Name: ns3     Value: 192.0.2.30        Proxy: OFF
 
 The **Proxy toggle must be off** (grey cloud). Orange-cloud proxying would terminate the DNS request at Cloudflare, defeating the entire GSLB purpose.
 
-**Step 2 — Delete any existing A records for the delegated name itself.**
+**Step 2 , Delete any existing A records for the delegated name itself.**
 
 If the zone has `dns.example.com A 1.2.3.4` records, delete them. They will be shadowed by the NS records anyway, but leaving them causes confusing warnings and makes the zone harder to reason about.
 
-**Step 3 — Add the NS delegation records.**
+**Step 3 , Add the NS delegation records.**
 
 ```
 Type: NS     Name: dns     Value: ns1.example.com
@@ -1241,7 +1241,7 @@ Type: NS     Name: dns     Value: ns3.example.com
 
 In Cloudflare's UI, `Name: dns` is shorthand for `dns.example.com.`.
 
-**Step 4 — Do NOT add a DS record.**
+**Step 4 , Do NOT add a DS record.**
 
 If the parent zone is DNSSEC-signed and you add a DS record for the child, DNSSEC-validating resolvers will expect the child to be signed and will reject its unsigned answers. Without a DS record, the child is treated as an **insecure delegation**, which is the correct state until DNSSEC signing for the child zone is implemented.
 
@@ -1326,9 +1326,9 @@ When `ROOT_ZONE_FILE` is configured (or a `root.zone` file exists in the working
 
 At startup the resolver attempts, in order:
 
-1. **JSON cache** — if a `root_zone.json` file exists, it is loaded and used immediately. JSON is pre-parsed, so startup is near-instant.
-2. **Text file** — if the JSON cache is absent or invalid, the resolver parses `root.zone` from disk.
-3. **Background download** — if neither is present, the resolver starts immediately and downloads the root zone in the background. Queries arriving before the download completes fall back to live root server queries.
+1. **JSON cache** , if a `root_zone.json` file exists, it is loaded and used immediately. JSON is pre-parsed, so startup is near-instant.
+2. **Text file** , if the JSON cache is absent or invalid, the resolver parses `root.zone` from disk.
+3. **Background download** , if neither is present, the resolver starts immediately and downloads the root zone in the background. Queries arriving before the download completes fall back to live root server queries.
 
 The resolver never blocks startup on a network fetch.
 
@@ -1348,7 +1348,7 @@ Dynamically-learned delegations are never touched by a refresh. Only root-zone-s
 
 ## Atomicity and Failure Handling
 
-If a refresh fails at any stage — network, parse, validation, write — the previous known-good root zone remains in place and in use. The failure is recorded in the status and subject to backoff.
+If a refresh fails at any stage , network, parse, validation, write , the previous known-good root zone remains in place and in use. The failure is recorded in the status and subject to backoff.
 
 If the root zone file becomes too old (`ROOT_ZONE_MAX_AGE_DAYS`, default 30), the status is marked `TooOld` and the resolver falls back to live root server queries. The root zone is not deleted; a subsequent successful refresh restores validity.
 
@@ -1482,7 +1482,7 @@ Traffic is aggregated by IPv4 `/24` and IPv6 `/64`. Token acquisition uses atomi
 
 ## Transport Isolation
 
-Connection-oriented transports — TCP, DoT, DoQ, DoH, and DoH3 — use the subnet token bucket without UDP duplicate-domain penalties. This avoids incorrectly penalizing legitimate pipelined or multiplexed DNS connections.
+Connection-oriented transports , TCP, DoT, DoQ, DoH, and DoH3 , use the subnet token bucket without UDP duplicate-domain penalties. This avoids incorrectly penalizing legitimate pipelined or multiplexed DNS connections.
 
 ## UDP Duplicate-Domain RRL
 
@@ -1628,7 +1628,7 @@ Consequently, DNS responses containing Algorithm 18 signatures can exceed the 1,
 
 # Deployment
 
-## Option A — Standalone Deployment
+## Option A , Standalone Deployment
 
 The resolver terminates DoT, DoQ, DoH (HTTP/1.1 and HTTP/2), and DoH3 (HTTP/3 over QUIC) directly.
 
@@ -1685,7 +1685,7 @@ Environment="GEO_ROUTING_TTL=10"
 Environment="GEO_HEALTH_INTERVAL=10"
 Environment="GEO_IP_FAILOVER_IP=3"
 
-# Peer mesh — set GEO_SELF_NODE to match this node's NODE<N>_NAME
+# Peer mesh , set GEO_SELF_NODE to match this node's NODE<N>_NAME
 Environment="GEO_SELF_NODE=europe-1"
 Environment="GEO_PEER_SECRET=<replace with 64-char hex secret>"
 Environment="GEO_PEER_HEARTBEAT_INTERVAL=3"
@@ -1735,7 +1735,7 @@ sudo systemctl enable --now unified-dns.service
 
 Then configure the delegation in your parent zone's DNS panel as described in [Delegating a GSLB Name](#delegating-a-gslb-name).
 
-## Option B — Reverse Proxy Deployment
+## Option B , Reverse Proxy Deployment
 
 A reverse proxy can terminate public HTTPS and HTTP/3 while the resolver listens locally in unencrypted HTTP mode.
 
