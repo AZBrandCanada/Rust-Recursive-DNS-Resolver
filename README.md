@@ -93,7 +93,7 @@ sudo setcap 'cap_net_bind_service=+ep' /path/to/unified-dns
 If you only want the binary and do not need to modify the code:
 
 ```bash
-cargo install --git https://github.com/AZBrandCanada/Rust-Recursive-DNS-Resolver
+cargo install unified-dns
 ```
 
 The binary is installed to `~/.cargo/bin/unified-dns`.
